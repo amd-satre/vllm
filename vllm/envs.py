@@ -1468,6 +1468,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     #     use BF16/FP16 GEMM, dequantizing weights and running QDQ on activations.
     #     This is only meant for research purposes to run on devices where NVFP4
     #     GEMM kernels are not available.
+    # - "bf16-dequant-gemm":
+    #     prototype backend that dequantizes packed weights directly to BF16 and
+    #     then relies on BF16 GEMM. This is intended for performance experiments.
     # - <none>: automatically pick an available backend
     "VLLM_NVFP4_GEMM_BACKEND": env_with_choices(
         "VLLM_NVFP4_GEMM_BACKEND",
@@ -1479,6 +1482,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "cutlass",
             "marlin",
             "emulation",
+            "bf16-dequant-gemm",
         ],
     ),
     # Controls garbage collection during CUDA graph capture.

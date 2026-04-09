@@ -3,13 +3,17 @@
 from types import SimpleNamespace
 
 import torch
+import torch.nn.functional as F
 
 from vllm.scalar_type import scalar_types
 
 __all__ = [
     "break_fp4_bytes",
+    "break_fp4_bytes_bf16_fast",
+    "dequantize_to_bf16_fast",
     "dequantize_to_dtype",
     "ref_nvfp4_quant",
+    "run_nvfp4_bf16_gemm",
 ]
 
 FLOAT4_E2M1_MAX = scalar_types.float4_e2m1f.max()
@@ -17,6 +21,29 @@ FLOAT4_E2M1_MAX_RECIPROCAL = 1 / FLOAT4_E2M1_MAX
 
 kE2M1ToFloat_handle = SimpleNamespace(
     val=torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float32)
+)
+kFP4ToBf16_handle = SimpleNamespace(
+    val=torch.tensor(
+        [
+            0.0,
+            0.5,
+            1.0,
+            1.5,
+            2.0,
+            3.0,
+            4.0,
+            6.0,
+            -0.0,
+            -0.5,
+            -1.0,
+            -1.5,
+            -2.0,
+            -3.0,
+            -4.0,
+            -6.0,
+        ],
+        dtype=torch.bfloat16,
+    )
 )
 
 
@@ -38,6 +65,22 @@ def break_fp4_bytes(a, dtype):
     values = kE2M1[abs_vals] * torch.where(signs, -1.0, 1.0)
     # Reshape to final form
     return values.reshape(m, n * 2).to(dtype=dtype)
+
+
+def break_fp4_bytes_bf16_fast(a: torch.Tensor) -> torch.Tensor:
+    assert a.dtype == torch.uint8
+    m, n = a.shape
+    a_flat = a.flatten()
+    high = ((a_flat & 0xF0) >> 4).to(torch.long)
+    low = (a_flat & 0x0F).to(torch.long)
+
+    lut = kFP4ToBf16_handle.val
+    low_values = lut[low].reshape(m, n)
+    high_values = lut[high].reshape(m, n)
+    values = torch.empty((m, n * 2), device=a.device, dtype=torch.bfloat16)
+    values[:, 0::2] = low_values
+    values[:, 1::2] = high_values
+    return values
 
 
 def convert_swizzled_to_linear(a_sf_swizzled: torch.Tensor, m, k, block_size):
@@ -64,6 +107,15 @@ def dequantize_to_dtype(
     - 2D: [m, packed_k] -> [m, k]
     - 3D: [dim0, m, packed_k] -> [dim0, m, k]
     """
+    if dtype == torch.bfloat16:
+        return dequantize_to_bf16_fast(
+            tensor_fp4=tensor_fp4,
+            tensor_sf=tensor_sf,
+            global_scale=global_scale,
+            block_size=block_size,
+            swizzle=swizzle,
+        )
+
     # Two fp4 values are packed into one uint8.
     assert tensor_fp4.dtype == torch.uint8
 
@@ -100,6 +152,51 @@ def dequantize_to_dtype(
     out = out.reshape(*out.shape[:-2], -1)
 
     return out.to(dtype)
+
+
+def dequantize_to_bf16_fast(
+    tensor_fp4: torch.Tensor,
+    tensor_sf: torch.Tensor,
+    global_scale: torch.Tensor,
+    block_size: int = 16,
+    swizzle: bool | None = True,
+):
+    """Fast-path dequantization for BF16 consumers."""
+    # Two fp4 values are packed into one uint8.
+    assert tensor_fp4.dtype == torch.uint8
+
+    # We handle 3D tensors reshaping them to 2D.
+    is_3d = tensor_fp4.ndim == 3
+
+    if is_3d:
+        dim0, m, packed_k = tensor_fp4.shape
+        tensor_fp4 = tensor_fp4.reshape(-1, packed_k)
+        tensor_sf = tensor_sf.reshape(-1, tensor_sf.shape[-1])
+        global_scale = global_scale[:, None, None]
+    else:
+        m, packed_k = tensor_fp4.shape
+
+    k = packed_k * 2
+    tensor_dq = break_fp4_bytes_bf16_fast(tensor_fp4)
+    tensor_dq = tensor_dq.reshape(-1, k // block_size, block_size)
+    tensor_sf = tensor_sf.view(torch.float8_e4m3fn)
+
+    if swizzle:
+        tensor_sf = convert_swizzled_to_linear(  # noqa: E501
+            tensor_sf, tensor_dq.size(0), k, block_size
+        )
+
+    if is_3d:
+        tensor_sf = tensor_sf.reshape(dim0, m, k // block_size)
+    tensor_sf_dtype = (tensor_sf.to(torch.float32) * global_scale).to(torch.bfloat16)
+
+    if is_3d:
+        tensor_dq = tensor_dq.reshape(dim0, m, -1, block_size)
+
+    out = tensor_dq * tensor_sf_dtype.unsqueeze(-1)
+    out = out.reshape(*out.shape[:-2], -1)
+
+    return out
 
 
 def get_reciprocal(x):
@@ -204,3 +301,34 @@ def run_nvfp4_emulations(
         del w_dq
     del x_dq
     return out
+
+
+def run_nvfp4_bf16_gemm(
+    x: torch.Tensor,
+    input_global_scale: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale_swizzled: torch.Tensor,
+    weight_global_scale: torch.Tensor,
+    swizzle: bool | None = True,
+):
+    """Prototype path for validating NVFP4 weight dequant + BF16 GEMM."""
+    # assert(False)
+    group_size = 16
+    output_dtype = x.dtype
+
+    x_dq, _ = ref_nvfp4_quant_dequant(x, input_global_scale, block_size=group_size)
+    x_bf16 = x_dq.to(torch.bfloat16)
+
+    if weight.dtype == torch.bfloat16:
+        w_bf16 = weight
+    else:
+        w_bf16 = dequantize_to_bf16_fast(
+            tensor_fp4=weight.data.view(torch.uint8),
+            tensor_sf=weight_scale_swizzled.data,
+            global_scale=weight_global_scale,
+            block_size=group_size,
+            swizzle=swizzle,
+        )
+
+    out = F.linear(x_bf16, w_bf16)
+    return out.to(output_dtype)

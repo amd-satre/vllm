@@ -303,6 +303,8 @@ class ActivationQuantFusionPass(VllmPatternMatcherPass):
 
         if current_platform.is_cuda_alike():
             for quant_key in [kFp8Dynamic128Sym, kFp8Dynamic64Sym]:
+                if quant_key not in QUANT_OPS or quant_key not in FUSED_OPS:
+                    continue
                 for is_scale_transposed in [False, True]:
                     for is_e8m0 in [True, False]:
                         for is_tma_aligned in [False, True]:

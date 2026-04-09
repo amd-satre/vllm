@@ -18,7 +18,9 @@ from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
 )
 from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import (
     dequantize_to_dtype,
+    kFP4ToBf16_handle,
     kE2M1ToFloat_handle,
+    run_nvfp4_bf16_gemm,
     run_nvfp4_emulations,
 )
 from vllm.platforms import current_platform
@@ -39,6 +41,7 @@ class NvFp4LinearBackend(Enum):
     FLASHINFER_CUDNN = "flashinfer-cudnn"
     FBGEMM = "fbgemm"
     EMULATION = "emulation"
+    BF16_DEQUANT_GEMM = "bf16-dequant-gemm"
 
 
 NVFP4_LINEAR_BACKENDS = list(NvFp4LinearBackend)
@@ -80,6 +83,8 @@ def is_backend_supported(backend: NvFp4LinearBackend) -> tuple[bool, str | None]
         supported = has_fbgemm_gpu()
         if not supported:
             reason = "fbgemm_gpu is required"
+    elif backend == NvFp4LinearBackend.BF16_DEQUANT_GEMM:
+        supported = True
     elif backend == NvFp4LinearBackend.EMULATION:
         # e.g. AMD Instinct does not support native NVFP4.
         unsupported_reasons = {}
@@ -253,12 +258,19 @@ def convert_to_nvfp4_linear_kernel_format(
         layer.weight = torch.nn.Parameter(weight, requires_grad=False)
         layer.weight_scale = torch.nn.Parameter(weight_scale, requires_grad=False)
         layer.weights_padding_cols = weights_padding_cols
-    elif backend == NvFp4LinearBackend.EMULATION:
+    elif backend in (
+        NvFp4LinearBackend.EMULATION,
+        NvFp4LinearBackend.BF16_DEQUANT_GEMM,
+    ):
         # We can not call `.to(device)` during cuda graph capture - do it here instead.
         # (operation not permitted when stream is capturing)
         kE2M1ToFloat_handle.val = kE2M1ToFloat_handle.val.to(layer.weight.device)
+        kFP4ToBf16_handle.val = kFP4ToBf16_handle.val.to(layer.weight.device)
 
-        if emulation_dequantize_weights:
+        if (
+            backend == NvFp4LinearBackend.EMULATION
+            and emulation_dequantize_weights
+        ):
             # For emulation backend, optionally dequantize weights ahead of time.
             target_dtype = torch.get_default_dtype()
 
@@ -311,6 +323,20 @@ def apply_nvfp4_linear(
     elif backend == NvFp4LinearBackend.EMULATION:
         x_2d = x.reshape(-1, x.shape[-1])
         out = run_nvfp4_emulations(
+            x=x_2d,
+            input_global_scale=input_global_scale_inv,
+            weight=weight,
+            weight_scale_swizzled=weight_scale,
+            weight_global_scale=weight_global_scale,
+            swizzle=swizzle,
+        )
+        out = out[:, :output_size]
+        if bias is not None:
+            out = out + bias
+        return out.view(*output_shape)
+    elif backend == NvFp4LinearBackend.BF16_DEQUANT_GEMM:
+        x_2d = x.reshape(-1, x.shape[-1])
+        out = run_nvfp4_bf16_gemm(
             x=x_2d,
             input_global_scale=input_global_scale_inv,
             weight=weight,

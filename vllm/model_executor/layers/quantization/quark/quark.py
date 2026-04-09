@@ -27,7 +27,6 @@ from vllm.model_executor.layers.quantization.quark.quark_moe import (  # noqa: E
 from vllm.model_executor.layers.quantization.quark.schemes import (
     QuarkNVFP4,
     QuarkOCP_MX,
-    QuarkROCFP4,
     QuarkScheme,
     QuarkW4A8_MXFP4_FP8,
     QuarkW8A8Fp8,
@@ -706,7 +705,9 @@ class QuarkConfig(QuantizationConfig):
             if is_w4a8_supported:
                 return QuarkW4A8_MXFP4_FP8(weight_config, input_config)
         elif self._is_rocfp4(weight_config, input_config):
-            return QuarkROCFP4()
+            raise NotImplementedError(
+                "ROCFP4 is temporarily disabled in this environment."
+            )
         elif self._is_w_ocp_mx_a_x(weight_config, input_config):
             return QuarkOCP_MX(
                 weight_config,

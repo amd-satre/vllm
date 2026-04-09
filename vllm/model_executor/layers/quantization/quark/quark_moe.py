@@ -5,8 +5,12 @@ from typing import Any
 
 import quark.torch.kernel
 import torch
-from quark.torch.utils.pack import Pack_fp4
 from torch.nn.parameter import Parameter
+
+try:
+    from quark.torch.utils.pack import Pack_fp4
+except ImportError:
+    Pack_fp4 = None
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm import _custom_ops as ops
@@ -1704,6 +1708,11 @@ class Quark_rocFP4_MoEMethod(QuarkMoEMethod):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if self.emulate:
+            if Pack_fp4 is None:
+                raise RuntimeError(
+                    "Pack_fp4 is unavailable in this Quark build, but emulation "
+                    "was requested."
+                )
             packing_instance = Pack_fp4(None, "fp4")
 
             # Process w13_weight
