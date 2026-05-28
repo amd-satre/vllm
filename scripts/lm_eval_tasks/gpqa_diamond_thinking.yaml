@@ -1,0 +1,11 @@
+include: _gpqa_diamond_cot_zeroshot.yaml
+task: gpqa_diamond_thinking
+generation_kwargs:
+  until:
+    - "</s>"
+    - "<|im_end|>"
+  do_sample: true
+  temperature: 1.0
+  top_p: 0.95
+  top_k: 20
+  max_gen_toks: 8192

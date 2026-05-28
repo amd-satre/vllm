@@ -1,0 +1,9 @@
+include: gsm8k.yaml
+task: gsm8k_thinking
+generation_kwargs:
+  until:
+    - "</s>"
+    - "<|im_end|>"
+  do_sample: false
+  temperature: 0.0
+  max_gen_toks: 2048

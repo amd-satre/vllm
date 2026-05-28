@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from collections.abc import Callable
 from fractions import Fraction
 from functools import partial
@@ -34,6 +35,153 @@ from vllm.platforms import current_platform
 from .quark_scheme import QuarkScheme
 
 logger = init_logger(__name__)
+
+
+# ── FlyDSL a6w4 dispatch (gfx950, opt-in via env) ──────────────────────────
+# Reuses the FlyDSL plumbing in vllm.model_executor.layers.quantization.mxfp6_a4
+# (loaders for fp4_utils + compile_preshuffle_gemm_a6w4, MXFP6 E2M3 activation
+# quantizer, tile-config picker). The Quark loader provides packed-uint8 MXFP4
+# weights + uint8 E8M0 scales; we add the FlyDSL-specific preshuffle in
+# process_weights_after_loading and call the kernel in apply_weights.
+#
+# Env: VLLM_MX_USE_FLYDSL=1 enables FlyDSL for the (mxfp4, mxfp6_e2m3) combo.
+# Default off; the user opts in per benchmark run.
+_VLLM_MX_USE_FLYDSL = os.environ.get("VLLM_MX_USE_FLYDSL", "") == "1"
+
+_mxfp6_a4_helpers: Any = None
+try:
+    from vllm.model_executor.layers.quantization import mxfp6_a4 as _mxfp6_a4_helpers
+
+    _FLYDSL_HELPERS_AVAILABLE = True
+except Exception:  # noqa: BLE001
+    _FLYDSL_HELPERS_AVAILABLE = False
+
+
+# Module-level launcher cache, keyed by (M_pad, N, K, cfg). Launchers
+# specialize on shape + tile config; pointers are passed per call.
+_flydsl_launcher_cache: dict[tuple, Any] = {}
+
+
+def _flydsl_dispatch_available(input_dtype: str | None, weight_dtype: str) -> bool:
+    """Decide whether to route the (input, weight) combo through FlyDSL."""
+    if not _VLLM_MX_USE_FLYDSL:
+        return False
+    if not _FLYDSL_HELPERS_AVAILABLE:
+        return False
+    if not current_platform.is_rocm():
+        return False
+    try:
+        from vllm.platforms.rocm import on_gfx950
+
+        if not on_gfx950():
+            return False
+    except Exception:  # noqa: BLE001
+        return False
+    # Today: only the (mxfp4 weight, mxfp6_e2m3 act) combo. (mxfp4, mxfp4) is
+    # left on AITER's tuned ASM path, which is already fast on gfx950.
+    return weight_dtype == "mxfp4" and input_dtype == "mxfp6_e2m3"
+
+
+def _flydsl_a6w4_apply(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    """End-to-end MXFP6×MXFP4 GEMM via FlyDSL.
+
+    x:            bf16 [M, K]
+    weight:       uint8 [N, K // 2]   (MXFP4 packed, pre-shuffled in PWAL)
+    weight_scale: uint8 [N, K // 32]  (E8M0, pre-shuffled in PWAL)
+
+    Returns: bf16 [M, N]
+    """
+    assert _FLYDSL_HELPERS_AVAILABLE, "FlyDSL helpers not importable"
+    helpers = _mxfp6_a4_helpers
+
+    M_real, K = x.shape
+    N = weight.shape[0]
+    device = x.device
+
+    # Pad M up to a multiple of 32 (FlyDSL constraint: M >= 32, M % 32 == 0).
+    # M=1 (decode) → pad to 32; we waste 32× the GEMM work on the activation
+    # side but avoid a separate bf16 dequant kernel. For benchmarking we want
+    # the FlyDSL path on every call.
+    M_pad = max(32, ((M_real + 31) // 32) * 32)
+    if M_pad != M_real:
+        x_pad = torch.zeros((M_pad, K), device=device, dtype=x.dtype)
+        x_pad[:M_real].copy_(x)
+    else:
+        x_pad = x.contiguous()
+
+    fp4u = helpers._load_flydsl_fp4_utils()
+    compile_fn = helpers._load_a6w4_compile_fn()
+    flyc = helpers._flyc()
+
+    # ── Per-token activation quant: bf16 → MXFP6 E2M3 + E8M0 scales ──────
+    x_f32 = x_pad.float().contiguous()
+    a_unpacked, a_scales = helpers._per_token_mxfp6_e2m3(x_f32)  # (M,K) low-6, (M,K/32)
+    a_packed24 = helpers._pack_fp6_e2m3(a_unpacked)  # (M, K*3/4)
+    nblk = K // 32
+    a_kernel = torch.zeros((M_pad, K), device=device, dtype=torch.uint8)
+    a_kernel.view(M_pad, nblk, 32)[:, :, :24] = a_packed24.view(M_pad, nblk, 24)
+    sa_shuf = fp4u.shuffle_scale_w4(a_scales, 1, False)
+    # FlyDSL's DLTensorAdaptor doesn't handle DLPack code 14
+    # (float8_e8m0fnu); view as uint8 (matches the _to_bytes() trick in
+    # FlyDSL's own tests/kernels/test_preshuffle_gemm.py).
+    if sa_shuf.dtype != torch.uint8:
+        sa_shuf = sa_shuf.view(torch.uint8)
+
+    cfg = helpers._pick_kernel_config(M_pad, N, K)
+    key = (M_pad, N, K, cfg)
+    compiled = _flydsl_launcher_cache.get(key)
+    if compiled is None:
+        tile_m, tile_n, tile_k, lds_stage, use_async, waves_per_eu = cfg
+        launch_fn = compile_fn(
+            M=M_pad,
+            N=N,
+            K=K,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            out_dtype="bf16",
+            lds_stage=lds_stage,
+            use_async_copy=use_async,
+            waves_per_eu=waves_per_eu,
+        )
+        c_seed = torch.zeros((M_pad, N), device=device, dtype=torch.bfloat16)
+        dummy_bias = torch.empty(0, dtype=torch.bfloat16, device=device)
+        seed_args = (
+            c_seed.view(-1),
+            a_kernel.view(-1),
+            weight.view(-1),
+            sa_shuf.view(-1),
+            weight_scale.view(-1),
+            dummy_bias,
+            M_pad,
+            N,
+            torch.cuda.current_stream(),
+        )
+        compiled = flyc.compile(launch_fn, *seed_args)
+        _flydsl_launcher_cache[key] = compiled
+
+    c_bf16 = torch.zeros((M_pad, N), device=device, dtype=torch.bfloat16)
+    dummy_bias = torch.empty(0, dtype=torch.bfloat16, device=device)
+    compiled(
+        c_bf16.view(-1),
+        a_kernel.view(-1),
+        weight.view(-1),
+        sa_shuf.view(-1),
+        weight_scale.view(-1),
+        dummy_bias,
+        M_pad,
+        N,
+        torch.cuda.current_stream(),
+    )
+    y = c_bf16[:M_real]
+    if out_dtype != torch.bfloat16:
+        y = y.to(out_dtype)
+    return y
 
 
 try:
@@ -217,6 +365,20 @@ class QuarkOCP_MX(QuarkScheme):
             self.input_dtype != "mxfp4" or self.weight_dtype != "mxfp4"
         )
 
+        # FlyDSL a6w4 (MXFP4 weights × MXFP6_E2M3 activations) on gfx950:
+        # if the user has VLLM_MX_USE_FLYDSL=1 and the dtype combo matches,
+        # override the emulate fall-back with a real kernel dispatch.
+        self._use_flydsl = _flydsl_dispatch_available(
+            self.input_dtype, self.weight_dtype
+        )
+        if self._use_flydsl:
+            self.emulate = False
+            logger.info_once(
+                "QuarkOCP_MX: routing %s linears through FlyDSL a6w4 kernel.",
+                self.ocp_mx_scheme.value if self.ocp_mx_scheme else "<unknown>",
+                scope="local",
+            )
+
         self.emulation_dequantize_weights = emulation_dequantize_weights
         if self.emulation_dequantize_weights:
             logger.info_once(
@@ -228,7 +390,11 @@ class QuarkOCP_MX(QuarkScheme):
             rocm_aiter_ops.is_asm_fp4_gemm_dynamic_quant_enabled()
         )
 
-        if not self.emulate and (dynamic_mxfp4_quant is None or gemm_afp4wfp4 is None):
+        if (
+            not self.emulate
+            and not self._use_flydsl
+            and (dynamic_mxfp4_quant is None or gemm_afp4wfp4 is None)
+        ):
             # Currently need these kernels if not emulating
             raise NotImplementedError(
                 f"{self.__class__.__name__} requires AITER to be installed "
@@ -244,8 +410,10 @@ class QuarkOCP_MX(QuarkScheme):
                 "layers computed in high precision."
             )
 
-        if current_platform.supports_mx() and (
-            self.input_dtype != "mxfp4" or self.weight_dtype != "mxfp4"
+        if (
+            current_platform.supports_mx()
+            and not self._use_flydsl
+            and (self.input_dtype != "mxfp4" or self.weight_dtype != "mxfp4")
         ):
             logger.warning_once(
                 "The current platform supports native MXFP4/MXFP6 "
@@ -284,6 +452,19 @@ class QuarkOCP_MX(QuarkScheme):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         layer.weight = torch.nn.Parameter(layer.weight.data, requires_grad=False)
+
+        if self._use_flydsl:
+            fp4u = _mxfp6_a4_helpers._load_flydsl_fp4_utils()
+            with torch.no_grad():
+                b_shuf = fp4u.shuffle_weight_w4(
+                    layer.weight.data.contiguous(), 16, False, False
+                )
+                sb_shuf = fp4u.shuffle_scale_w4(
+                    layer.weight_scale.data.contiguous(), 1, False
+                )
+            layer.weight = torch.nn.Parameter(b_shuf, requires_grad=False)
+            layer.weight_scale = torch.nn.Parameter(sb_shuf, requires_grad=False)
+            return
 
         if self.emulate:
             layer.weight_scale = torch.nn.Parameter(
@@ -384,6 +565,15 @@ class QuarkOCP_MX(QuarkScheme):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if self._use_flydsl:
+            x2d = x.reshape(-1, x.shape[-1])
+            y2d = _flydsl_a6w4_apply(
+                x2d, layer.weight, layer.weight_scale, self.out_dtype
+            )
+            if bias is not None:
+                y2d = y2d + bias
+            return y2d.reshape(*x.shape[:-1], y2d.shape[-1])
+
         if self.emulate:
             if not self.emulation_dequantize_weights:
                 dq_w = self.dequant_func(layer.weight, layer.weight_scale, x.dtype)

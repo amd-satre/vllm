@@ -1,0 +1,9 @@
+include: _aime25.yaml
+task: aime25_greedy
+generation_kwargs:
+  until:
+    - "</s>"
+    - "<|im_end|>"
+  do_sample: false
+  temperature: 0.0
+  max_gen_toks: 8192
