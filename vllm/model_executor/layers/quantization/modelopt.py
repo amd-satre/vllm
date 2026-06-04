@@ -73,8 +73,8 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     create_fp8_quant_key,
     is_layer_skipped,
     kFp8DynamicTokenSym,
+    kFp8StaticChannelSym,
     kFp8StaticTensorSym,
-    kFp8StaticTokenSym,
     kNvfp4Dynamic,
     kNvfp4Static,
 )
@@ -590,7 +590,7 @@ class ModelOptFp8PcPtLinearMethod(LinearMethodBase):
 
         self.fp8_linear = init_fp8_linear_kernel(
             activation_quant_key=kFp8DynamicTokenSym,
-            weight_quant_key=kFp8StaticTokenSym,
+            weight_quant_key=kFp8StaticChannelSym,
             weight_shape=layer.weight.shape,
             input_dtype=self.input_dtype,
             out_dtype=self.out_dtype,
