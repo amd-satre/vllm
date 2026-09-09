@@ -11,6 +11,15 @@ import torch.nn.functional as F
 
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.logger import init_logger
+from vllm.model_executor.layers.quantization.flydsl_a6w4_linear import (
+    flydsl_a6w4_linear,
+    is_flydsl_a6w4_eligible,
+    is_flydsl_a6w4_supported,
+    preshuffle_weight,
+    preshuffle_weight_scale,
+    w4a6_vlog,
+    why_unavailable,
+)
 from vllm.model_executor.layers.quantization.utils.mxfp4_utils import (
     dequant_mxfp4,
     quant_dequant_mxfp4,
@@ -211,6 +220,32 @@ class QuarkOCP_MX(QuarkScheme):
             rocm_aiter_ops.is_asm_fp4_gemm_dynamic_quant_enabled()
         )
 
+        # FlyDSL W4A6 fast path: MXFP6-E2M3 activation x MXFP4 weight via the
+        # AITER-owned a6w4 preshuffle GEMM. Additive and capability-gated; when
+        # the kernel is unavailable a6w4 layers keep emulating (below). Per-layer
+        # shape eligibility (N%128, K%256) is decided in
+        # process_weights_after_loading.
+        self.is_a6w4 = (
+            not self.dynamic_mxfp4_quant
+            and self.weight_dtype == "mxfp4"
+            and self.input_dtype == "mxfp6_e2m3"
+        )
+        self.use_flydsl_a6w4 = self.is_a6w4 and is_flydsl_a6w4_supported()
+        if self.is_a6w4:
+            if self.use_flydsl_a6w4:
+                logger.info_once(
+                    "QuarkOCP_MX: routing W4A6 (mxfp6_e2m3 act / mxfp4 weight) "
+                    "linears through the FlyDSL a6w4 kernel.",
+                    scope="local",
+                )
+            else:
+                logger.info_once(
+                    "QuarkOCP_MX: W4A6 FlyDSL kernel unavailable (%s); using "
+                    "high-precision emulation for mxfp6_e2m3 x mxfp4 linears.",
+                    why_unavailable(),
+                    scope="local",
+                )
+
         if not self.emulate and (dynamic_mxfp4_quant is None or gemm_afp4wfp4 is None):
             # Currently need these kernels if not emulating
             raise NotImplementedError(
@@ -227,8 +262,10 @@ class QuarkOCP_MX(QuarkScheme):
                 "layers computed in high precision."
             )
 
-        if current_platform.supports_mx() and (
-            self.input_dtype != "mxfp4" or self.weight_dtype != "mxfp4"
+        if (
+            current_platform.supports_mx()
+            and not self.use_flydsl_a6w4
+            and (self.input_dtype != "mxfp4" or self.weight_dtype != "mxfp4")
         ):
             logger.warning_once(
                 "The current platform supports native MXFP4/MXFP6 "
@@ -262,16 +299,52 @@ class QuarkOCP_MX(QuarkScheme):
         self, layer: torch.nn.Module
     ) -> None:
         w_q, w_s = dynamic_mxfp4_quant(layer.weight)
-        layer.weight_scale = torch.nn.Parameter(w_s.T.contiguous(), requires_grad=False)
+        # The native gemm kernel expects the scale transposed ([K//32, N]); the
+        # emulation path's dequant_mxfp4 expects it untransposed ([N, K//32]).
+        # Transposing unconditionally corrupted emulated W4A6 linears whose
+        # weights are dynamically mxfp4-quantized (e.g. DeepSeek MLA attention,
+        # bf16 in the checkpoint).
+        w_s = w_s.T.contiguous() if not self.emulate else w_s.contiguous()
+        layer.weight_scale = torch.nn.Parameter(w_s, requires_grad=False)
         layer.weight = torch.nn.Parameter(w_q, requires_grad=False)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         layer.weight = torch.nn.Parameter(layer.weight.data, requires_grad=False)
 
+        # FlyDSL W4A6 fast path (additive, per-layer shape-gated). MXFP4 weight
+        # is packed uint8 [N, K//2] at this point -- EXCEPT for dynamically
+        # quantized layers (bf16 in the checkpoint, e.g. DeepSeek MLA attention),
+        # which must be packed to mxfp4 here before preshuffle.
+        if self.use_flydsl_a6w4:
+            if self.dynamic_mxfp4_quant and layer.weight.dtype != torch.uint8:
+                w_q, w_s = dynamic_mxfp4_quant(layer.weight)  # [N,K//2], [N,K//32]
+                layer.weight = torch.nn.Parameter(w_q, requires_grad=False)
+                layer.weight_scale = torch.nn.Parameter(w_s, requires_grad=False)
+            n = layer.weight.shape[0]
+            k = layer.weight.shape[1] * 2
+            if is_flydsl_a6w4_eligible(n, k):
+                layer.weight = torch.nn.Parameter(
+                    preshuffle_weight(layer.weight.data), requires_grad=False
+                )
+                layer.weight_scale = torch.nn.Parameter(
+                    preshuffle_weight_scale(layer.weight_scale.data),
+                    requires_grad=False,
+                )
+                layer._flydsl_a6w4 = True
+                return
+            logger.warning_once(
+                "QuarkOCP_MX: W4A6 layer N=%d K=%d ineligible for the FlyDSL "
+                "kernel (needs N%%128, K%%256); using emulation for this layer.",
+                n,
+                k,
+                scope="local",
+            )
+
         if self.emulate:
-            if self.dynamic_mxfp4_quant:
+            if self.dynamic_mxfp4_quant and layer.weight.dtype != torch.uint8:
+                # Not already packed by the flydsl branch above.
                 self.process_dynamic_mxfp4_weights_after_loading(layer)
-            else:
+            elif not self.dynamic_mxfp4_quant:
                 layer.weight_scale = torch.nn.Parameter(
                     layer.weight_scale.data, requires_grad=False
                 )
@@ -363,7 +436,29 @@ class QuarkOCP_MX(QuarkScheme):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        # FlyDSL W4A6 fast path (set per-layer in process_weights_after_loading).
+        if getattr(layer, "_flydsl_a6w4", False):
+            n, k = layer.weight.shape[0], layer.weight.shape[1] * 2
+            w4a6_vlog(
+                ("dense-dispatch", n, k),
+                f"dense Linear -> W4A6 FlyDSL a6w4 path  N={n} K={k} "
+                f"(weight_dtype={self.weight_dtype} input_dtype={self.input_dtype})",
+            )
+            x2d = x.reshape(-1, x.shape[-1])
+            y2d = flydsl_a6w4_linear(
+                x2d, layer.weight, layer.weight_scale, self.out_dtype
+            )
+            if bias is not None:
+                y2d = y2d + bias
+            return y2d.reshape(*x.shape[:-1], y2d.shape[-1])
+
         if self.emulate:
+            w4a6_vlog(
+                ("dense-emulate", self.weight_dtype, self.input_dtype,
+                 layer.weight.shape[1]),
+                f"dense Linear -> EMULATION QDQ (NOT kernel)  "
+                f"weight_dtype={self.weight_dtype} input_dtype={self.input_dtype}",
+            )
             dq_w = self.dequant_func(layer.weight, layer.weight_scale, x.dtype)
             qdq_x = self.quant_dequant_func(x)
             return F.linear(qdq_x, dq_w, bias)

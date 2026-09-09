@@ -148,10 +148,28 @@ class QuarkConfig(QuantizationConfig):
         if should_ignore_layer(
             prefix, ignore=exclude_layers, fused_mapping=self.packed_modules_mapping
         ):
+            # DSV3 fp4-weight models re-quantize excluded attention projections
+            # to *dynamic mxfp4* (fast asm/triton GEMM) even though they are
+            # excluded from weight-quant. This is only a win when the resulting
+            # scheme has a native attention kernel. For the w4a6 scheme
+            # (mxfp6-e2m3 activations) there is no such kernel, so the override
+            # would fall back to slow bf16 dequant-emulation on every layer.
+            # Keep those attention projections BF16-native instead.
+            # Match the exact dtype this path handles: a substring test on "fp6"
+            # would also catch mxfp6_e3m2, silently switching that scheme's
+            # excluded attention projections from dynamic MXFP4 to unquantized.
+            # This reads the *raw* config, where Quark serializes "fp6_e2m3";
+            # the "mx" prefix is added later by QuarkOCP_MX. Normalize the same
+            # way it does rather than comparing against the normalized spelling
+            # here, which never matches and silently disables this exemption.
+            gqc = self.quant_config.get("global_quant_config", {}) or {}
+            act_dtype = str((gqc.get("input_tensors") or {}).get("dtype", ""))
+            is_mxfp6_act = act_dtype.replace("fp", "mxfp") == "mxfp6_e2m3"
             if (
                 "self_attn" not in prefix  # only quantize attention projections
                 or not getattr(self, "dynamic_mxfp4_quant", False)
                 or not isinstance(layer, LinearBase)  # Ignore other methods
+                or is_mxfp6_act  # w4a6: no fast attn kernel -> keep BF16, not emulate
             ):
                 return UnquantizedLinearMethod()
 
