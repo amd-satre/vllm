@@ -373,3 +373,51 @@ def test_hf_overrides_text_config_dict_sets_mode() -> None:
     config = Qwen4ExpConfig(text_config=_config().to_dict())
     config.update({"ple_embedding_mode": "per_token"})
     assert get_ple_embedding_mode(config.get_text_config()) == "ngram"
+
+
+def test_text_only_model_skips_vision_tower_tensors() -> None:
+    """Text-only exports keep ``model.visual.*``; bf16 original and uint4 export
+    both name it that way (the language model is ``model.language_model.*`` in
+    the original and ``model.*`` in the uint4 export)."""
+    from vllm.models.qwen4_exp.amd.model import Qwen4ExpForCausalLM
+
+    model = object.__new__(Qwen4ExpForCausalLM)
+    nn.Module.__init__(model)
+    model.model = nn.Module()
+    model.model.w = nn.Parameter(torch.zeros(2), requires_grad=False)
+    model.model.v = nn.Parameter(torch.zeros(2), requires_grad=False)
+    weights = [
+        ("model.visual.blocks.0.attn.qkv.weight", torch.ones(3)),
+        ("model.visual.merger.linear_fc1.bias", torch.ones(3)),
+        ("model.language_model.w", torch.ones(2)),  # original layout
+        ("model.v", torch.full((2,), 2.0)),  # uint4 export layout
+    ]
+    assert model.load_weights(weights) == {"model.w", "model.v"}
+    assert model.model.w.tolist() == [1.0, 1.0]
+    assert model.model.v.tolist() == [2.0, 2.0]
+
+
+def test_flat_text_config_mode_and_overrides() -> None:
+    """uint4 export: flat config (model_type qwen4_exp_text), field at top level."""
+    config = _config(ple_embedding_mode="per_token")
+    flat = Qwen4ExpTextConfig.from_dict(config.to_dict())
+    assert flat.get_text_config() is flat
+    assert get_ple_embedding_mode(flat) == "per_token"
+    # hf_overrides={"ple_embedding_mode": ...} on a flat config (config.update)
+    flat = _config()
+    flat.update({"ple_embedding_mode": "zero"})
+    assert get_ple_embedding_mode(flat.get_text_config()) == "zero"
+
+
+@pytest.mark.parametrize("mode", ["per_token", "zero"])
+def test_new_modes_ignore_engram_cpu_offload(
+    monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    """No table exists, so engram_config (cpu_offload) is never consulted."""
+
+    def _fail():
+        raise AssertionError("engram_config must not be read in this mode")
+
+    monkeypatch.setattr(amd_ple_layer, "get_current_vllm_config", _fail)
+    module = _per_token(mode)
+    assert module(torch.tensor([1, 2])).shape == (2, DIM)

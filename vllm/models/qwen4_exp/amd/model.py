@@ -796,8 +796,10 @@ class Qwen4ExpForCausalLM(
         return positions.unsqueeze(0).expand(3, -1), 0
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        # The text-only model has no vision tower; checkpoints exported from
+        # the multimodal model still carry it as ``model.visual.*``.
         mapper = self.hf_to_vllm_mapper | WeightsMapper(
-            orig_to_new_substr={"mtp.": None}
+            orig_to_new_substr={"mtp.": None, "model.visual.": None}
         )
         loader = AutoWeightsLoader(
             self,
