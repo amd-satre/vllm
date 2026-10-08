@@ -563,7 +563,8 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
             table_rows = 0
         # Grepped by the benchmark harness to validate the run configuration.
         logger.info(
-            "PLE ple_embedding_mode=%s table_rows=%d layer=%s",
+            "PLE mode=%s ple_embedding_mode=%s table_rows=%d layer=%s",
+            self.ple_embedding_mode,
             self.ple_embedding_mode,
             table_rows,
             prefix,
