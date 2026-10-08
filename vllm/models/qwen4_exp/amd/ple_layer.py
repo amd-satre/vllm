@@ -6,6 +6,7 @@ from collections.abc import Iterable, Sequence
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 from transformers import Qwen4ExpTextConfig
 
 from vllm.config import CacheConfig, ModelConfig, VllmConfig, get_current_vllm_config
@@ -35,6 +36,12 @@ from ..common.ngram_embedding import (
     Qwen4ExpPLEPinnedHostEmbedding,
 )
 from ..common.ops.ple import ple_conv, ple_gate, ple_ngram_ids
+from ..common.ple_mode import (
+    PLE_EMBEDDING_MODE_NGRAM,
+    PLE_EMBEDDING_MODE_PER_TOKEN,
+    PLE_EMBEDDING_MODE_ZERO,
+    validate_ple_embedding_config,
+)
 
 logger = init_logger(__name__)
 
@@ -308,6 +315,11 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         )
         return output
 
+    def dequantize(
+        self, embeddings: torch.Tensor, output_dtype: torch.dtype
+    ) -> torch.Tensor:
+        return self.ngram_embedding.dequantize(embeddings, output_dtype)
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load hash buffers and checkpoint-split embedding rows."""
         persistent_buffers = {
@@ -374,6 +386,124 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         return loaded
 
 
+# Checkpoint tensors of the n-gram embedding that the per-token / zero modes
+# do not use; they are skipped without error.
+_NGRAM_ONLY_BUFFERS = frozenset(
+    {"layer_multipliers", "ngram_heads_offsets", "ngram_heads_vocab_sizes"}
+)
+
+
+class Qwen4ExpPerTokenEmbedding(nn.Module):
+    """PLE embedding without the n-gram hash table (``per_token``/``zero``).
+
+    ``per_token``: ``forward`` returns ``per_token_table[input_ids]``, where the
+    table is a plain, TP-replicated parameter of shape
+    ``[vocab_size, embedding_dim]`` (checkpoint tensor name
+    ``<prefix>.per_token_table.weight``). Ids are clamped into
+    ``[0, vocab_size - 1]`` on device (no host sync, safe under CUDA graphs and
+    torch.compile) instead of raising: an out-of-range id reads the first or
+    last row.
+
+    ``zero``: no table exists; ``forward`` returns zeros of shape
+    ``[num_tokens, embedding_dim]`` in ``params_dtype`` on ``input_ids.device``.
+
+    ``query_start_loc`` and ``ngram_context`` are accepted for interface
+    compatibility with :class:`Qwen4ExpNGramEmbedding` and ignored.
+    """
+
+    def __init__(
+        self,
+        config: Qwen4ExpTextConfig,
+        embedding_dim: int,
+        mode: str,
+        *,
+        params_dtype: torch.dtype | None = None,
+    ) -> None:
+        super().__init__()
+        if mode not in (PLE_EMBEDDING_MODE_PER_TOKEN, PLE_EMBEDDING_MODE_ZERO):
+            raise ValueError(f"Unsupported PLE embedding mode {mode!r}")
+        self.mode = mode
+        self.embedding_dim = int(embedding_dim)
+        self.vocab_size = int(config.vocab_size)
+        self.params_dtype = (
+            params_dtype if params_dtype is not None else torch.get_default_dtype()
+        )
+        if mode == PLE_EMBEDDING_MODE_PER_TOKEN:
+            # nn.Embedding gives the checkpoint name per_token_table.weight;
+            # the weight is overwritten by load_weights, so skip random init.
+            self.per_token_table = nn.Embedding(
+                self.vocab_size,
+                self.embedding_dim,
+                _weight=torch.empty(
+                    self.vocab_size, self.embedding_dim, dtype=self.params_dtype
+                ),
+                _freeze=True,
+            )
+        logger.info(
+            "Initialized AMD PLE embedding in %s mode (vocab=%d, dim=%d, dtype=%s)",
+            mode,
+            self.vocab_size,
+            self.embedding_dim,
+            self.params_dtype,
+        )
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        query_start_loc: torch.Tensor | None = None,
+        ngram_context: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        del query_start_loc, ngram_context
+        input_ids = input_ids.reshape(-1)
+        if self.mode == PLE_EMBEDDING_MODE_ZERO:
+            return torch.zeros(
+                (input_ids.shape[0], self.embedding_dim),
+                dtype=self.params_dtype,
+                device=input_ids.device,
+            )
+        ids = input_ids.long().clamp(0, self.vocab_size - 1)
+        return F.embedding(ids, self.per_token_table.weight)
+
+    def dequantize(
+        self, embeddings: torch.Tensor, output_dtype: torch.dtype
+    ) -> torch.Tensor:
+        del output_dtype
+        return embeddings
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        """Load ``per_token_table.weight``; skip the n-gram-only tensors."""
+        loaded: set[str] = set()
+        for name, loaded_weight in weights:
+            leaf_name = name.rsplit(".", 1)[-1]
+            if (
+                leaf_name.startswith("hashstats_")
+                or leaf_name == "token_lookup"
+                or name in _NGRAM_ONLY_BUFFERS
+                or name.startswith("ngram_embedding.")
+            ):
+                continue
+            if name == "per_token_table.weight":
+                if self.mode == PLE_EMBEDDING_MODE_ZERO:
+                    continue
+                weight = self.per_token_table.weight
+                if weight.shape != loaded_weight.shape:
+                    raise ValueError(
+                        f"Shape mismatch for {name}: expected "
+                        f"{tuple(weight.shape)}, got {tuple(loaded_weight.shape)}"
+                    )
+                with torch.no_grad():
+                    weight.copy_(
+                        loaded_weight.to(device=weight.device, dtype=weight.dtype)
+                    )
+                loaded.add(name)
+                continue
+            raise ValueError(
+                f"Unexpected PLE embedding tensor {name!r} in "
+                f"ple_embedding_mode={self.mode!r}"
+            )
+        return loaded
+
+
 class Qwen4ExpPLELayer(nn.Module, MambaBase):
     def __init__(
         self,
@@ -404,17 +534,27 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         self.conv_state_len = (self.conv_kernel_size - 1) * self.short_conv_dilation
         self.num_spec_tokens = vllm_config.num_speculative_tokens
         self.activation = "silu"
-        self.ple_embedding: nn.Module = Qwen4ExpNGramEmbedding(
-            config,
-            int(config.ple_embed_dim),
-            self.ple_dense_layer_id,
-            vllm_config.scheduler_config.max_num_batched_tokens,
-            f"{prefix}.ple_embedding",
-            prefix,
-            data_parallel_rank=vllm_config.parallel_config.data_parallel_rank,
-            quant_config=quant_config,
-            params_dtype=model_config.dtype,
-        )
+        self.ple_embedding_mode = validate_ple_embedding_config(config)
+        self.ple_embedding: nn.Module
+        if self.ple_embedding_mode == PLE_EMBEDDING_MODE_NGRAM:
+            self.ple_embedding = Qwen4ExpNGramEmbedding(
+                config,
+                int(config.ple_embed_dim),
+                self.ple_dense_layer_id,
+                vllm_config.scheduler_config.max_num_batched_tokens,
+                f"{prefix}.ple_embedding",
+                prefix,
+                data_parallel_rank=vllm_config.parallel_config.data_parallel_rank,
+                quant_config=quant_config,
+                params_dtype=model_config.dtype,
+            )
+        else:
+            self.ple_embedding = Qwen4ExpPerTokenEmbedding(
+                config,
+                int(config.ple_embed_dim),
+                self.ple_embedding_mode,
+                params_dtype=model_config.dtype,
+            )
         # The PLE cache is TP-replicated, so this merged projection is too.
         self.kv_proj = MergedColumnParallelLinear(
             int(config.ple_embed_dim),
@@ -688,9 +828,7 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
                 f"{hidden_states.shape[0]}"
             )
         embeddings = self.ple_embedding(input_ids, query_start_loc, ngram_context)
-        embeddings = self.ple_embedding.ngram_embedding.dequantize(
-            embeddings, hidden_states.dtype
-        )
+        embeddings = self.ple_embedding.dequantize(embeddings, hidden_states.dtype)
         kv, _ = self.kv_proj(embeddings)
         key, value = kv.split(self.kv_proj.output_sizes, dim=-1)
         gated_output, conv_input = ple_gate(
@@ -818,6 +956,7 @@ direct_register_custom_op(
 
 __all__ = [
     "Qwen4ExpNGramEmbedding",
+    "Qwen4ExpPerTokenEmbedding",
     "Qwen4ExpPLEGroupedNorm",
     "Qwen4ExpPLELayer",
 ]

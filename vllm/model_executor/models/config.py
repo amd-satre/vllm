@@ -916,6 +916,11 @@ class Qwen4ExpForConditionalGenerationConfig(Qwen3_5ForConditionalGenerationConf
         text_config = vllm_config.model_config.hf_text_config
         if text_config.hc_count <= 1:
             raise ValueError("Qwen4Exp requires hc_count > 1")
+        from vllm.models.qwen4_exp.common.ple_mode import (
+            validate_ple_embedding_config,
+        )
+
+        validate_ple_embedding_config(text_config)
         parallel_config = vllm_config.parallel_config
         uses_ple_or_qsa = bool(text_config.ple_layer_ids) or (
             getattr(text_config, "indexer_n_heads", None) is not None
