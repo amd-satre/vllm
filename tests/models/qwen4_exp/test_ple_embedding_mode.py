@@ -340,3 +340,36 @@ def test_verify_and_update_config_rejects_invalid_mode() -> None:
             Qwen4ExpForConditionalGenerationConfig.verify_and_update_config(
                 vllm_config("bogus")
             )
+
+
+@pytest.mark.parametrize("mode", PLE_EMBEDDING_MODES)
+def test_mode_is_read_from_text_config_of_composite_config(mode: str) -> None:
+    """hf_overrides text_config.ple_embedding_mode must reach the layer."""
+    from transformers import Qwen4ExpConfig
+
+    text = _config().to_dict()
+    text["ple_embedding_mode"] = mode
+    composite = Qwen4ExpConfig(text_config=text)
+    assert get_ple_embedding_mode(composite.get_text_config()) == mode
+    # A top-level field is NOT seen by the layer (it reads the text config).
+    top = Qwen4ExpConfig(text_config=_config().to_dict(), ple_embedding_mode=mode)
+    assert get_ple_embedding_mode(top.get_text_config()) == "ngram"
+
+
+def test_hf_overrides_text_config_dict_sets_mode() -> None:
+    """Same call as ModelConfig: hf_overrides={"text_config": {...}}."""
+    from transformers import Qwen4ExpConfig
+
+    from vllm.config.model import ModelConfig
+
+    config = Qwen4ExpConfig(text_config=_config().to_dict())
+    model_config = object.__new__(ModelConfig)
+    model_config._apply_dict_overrides(
+        config, {"text_config": {"ple_embedding_mode": "per_token"}}
+    )
+    assert get_ple_embedding_mode(config.get_text_config()) == "per_token"
+    assert config.get_text_config().vocab_size == VOCAB  # other fields kept
+    # A top-level override would be a silent no-op for the layer.
+    config = Qwen4ExpConfig(text_config=_config().to_dict())
+    config.update({"ple_embedding_mode": "per_token"})
+    assert get_ple_embedding_mode(config.get_text_config()) == "ngram"

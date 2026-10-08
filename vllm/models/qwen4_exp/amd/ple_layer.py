@@ -555,6 +555,19 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
                 self.ple_embedding_mode,
                 params_dtype=model_config.dtype,
             )
+        if self.ple_embedding_mode == PLE_EMBEDDING_MODE_NGRAM:
+            table_rows = int(self.ple_embedding.ngram_embedding.org_vocab_size)
+        elif self.ple_embedding_mode == PLE_EMBEDDING_MODE_PER_TOKEN:
+            table_rows = int(self.ple_embedding.vocab_size)
+        else:
+            table_rows = 0
+        # Grepped by the benchmark harness to validate the run configuration.
+        logger.info(
+            "PLE ple_embedding_mode=%s table_rows=%d layer=%s",
+            self.ple_embedding_mode,
+            table_rows,
+            prefix,
+        )
         # The PLE cache is TP-replicated, so this merged projection is too.
         self.kv_proj = MergedColumnParallelLinear(
             int(config.ple_embed_dim),
