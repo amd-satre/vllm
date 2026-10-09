@@ -21,6 +21,7 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
 )
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
+    QuantizeMethodBase,
 )
 from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.utils.torch_utils import direct_register_custom_op
@@ -393,6 +394,27 @@ _NGRAM_ONLY_BUFFERS = frozenset(
 )
 
 
+class _PerTokenTableMethod(QuantizeMethodBase):
+    """Post-load hook: fail loudly if ``per_token_table.weight`` was not loaded.
+
+    The table is allocated uninitialized, and vLLM's generic "all weights were
+    loaded" check is skipped for quantized checkpoints, so without this a
+    checkpoint lacking the tensor would load silently and serve garbage.
+    """
+
+    requires_device_loading: bool = False
+    supports_pre_processed_weights: bool = True
+
+    def create_weights(self, layer: nn.Module, *weight_args, **extra_weight_attrs):
+        raise NotImplementedError("the per-token table is created by its owner")
+
+    def apply(self, layer: nn.Module, *args, **kwargs) -> torch.Tensor:
+        raise NotImplementedError("the per-token table is applied by its owner")
+
+    def process_weights_after_loading(self, layer: nn.Module) -> None:
+        layer.check_table_loaded()
+
+
 class Qwen4ExpPerTokenEmbedding(nn.Module):
     """PLE embedding without the n-gram hash table (``per_token``/``zero``).
 
@@ -428,7 +450,9 @@ class Qwen4ExpPerTokenEmbedding(nn.Module):
         self.params_dtype = (
             params_dtype if params_dtype is not None else torch.get_default_dtype()
         )
+        self.table_loaded = False
         if mode == PLE_EMBEDDING_MODE_PER_TOKEN:
+            self.quant_method = _PerTokenTableMethod()
             # nn.Embedding gives the checkpoint name per_token_table.weight;
             # the weight is overwritten by load_weights, so skip random init.
             self.per_token_table = nn.Embedding(
@@ -470,6 +494,30 @@ class Qwen4ExpPerTokenEmbedding(nn.Module):
         del output_dtype
         return embeddings
 
+    def check_table_loaded(self) -> None:
+        """Raise unless the per-token table was loaded from the checkpoint."""
+        if self.mode != PLE_EMBEDDING_MODE_PER_TOKEN:
+            return
+        weight = self.per_token_table.weight
+        if not self.table_loaded:
+            raise ValueError(
+                "ple_embedding_mode='per_token' but the checkpoint has no "
+                "tensor '...ple_embedding.per_token_table.weight' "
+                f"(expected shape {(self.vocab_size, self.embedding_dim)}, "
+                f"dtype {self.params_dtype}). Export a per-token checkpoint or "
+                "use ple_embedding_mode='ngram'/'zero'."
+            )
+        if tuple(weight.shape) != (self.vocab_size, self.embedding_dim):
+            raise ValueError(
+                f"per_token_table.weight has shape {tuple(weight.shape)}, expected "
+                f"{(self.vocab_size, self.embedding_dim)}"
+            )
+        logger.info(
+            "PLE per_token_table loaded=True shape=%s dtype=%s",
+            tuple(weight.shape),
+            weight.dtype,
+        )
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load ``per_token_table.weight``; skip the n-gram-only tensors."""
         loaded: set[str] = set()
@@ -491,10 +539,16 @@ class Qwen4ExpPerTokenEmbedding(nn.Module):
                         f"Shape mismatch for {name}: expected "
                         f"{tuple(weight.shape)}, got {tuple(loaded_weight.shape)}"
                     )
+                if loaded_weight.dtype not in (torch.bfloat16, weight.dtype):
+                    raise ValueError(
+                        f"dtype mismatch for {name}: expected bfloat16 or "
+                        f"{weight.dtype}, got {loaded_weight.dtype}"
+                    )
                 with torch.no_grad():
                     weight.copy_(
                         loaded_weight.to(device=weight.device, dtype=weight.dtype)
                     )
+                self.table_loaded = True
                 loaded.add(name)
                 continue
             raise ValueError(

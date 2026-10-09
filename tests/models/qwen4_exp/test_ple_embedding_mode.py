@@ -202,12 +202,18 @@ def test_per_token_loader_skips_ngram_tensors() -> None:
     assert torch.equal(module.per_token_table.weight, table)
 
 
-def test_per_token_loader_converts_dtype() -> None:
+def test_per_token_loader_dtype_policy() -> None:
     module = _per_token()
-    table = _table().float()
-    module.load_weights([("per_token_table.weight", table)])
-    assert module.per_token_table.weight.dtype == torch.bfloat16
-    assert torch.equal(module.per_token_table.weight, table.bfloat16())
+    with pytest.raises(ValueError, match="dtype mismatch"):
+        module.load_weights([("per_token_table.weight", _table().float())])
+    with pytest.raises(ValueError, match="dtype mismatch"):
+        module.load_weights([("per_token_table.weight", _table().int())])
+    assert not module.table_loaded
+    # bf16 checkpoint into an fp16 model is the one allowed cast
+    half = _per_token(dtype=torch.float16)
+    half.load_weights([("per_token_table.weight", _table())])
+    assert half.per_token_table.weight.dtype == torch.float16
+    assert half.table_loaded
 
 
 def test_per_token_loader_reports_missing_table() -> None:
@@ -421,3 +427,47 @@ def test_new_modes_ignore_engram_cpu_offload(
     monkeypatch.setattr(amd_ple_layer, "get_current_vllm_config", _fail)
     module = _per_token(mode)
     assert module(torch.tensor([1, 2])).shape == (2, DIM)
+
+
+def _model_config():
+    from unittest.mock import MagicMock
+
+    return MagicMock(
+        dtype=torch.bfloat16,
+        quantization=None,
+        word_embeddings_untied_by_checkpoint=False,
+    )
+
+
+def test_per_token_missing_table_fails_loudly_after_load() -> None:
+    """D1: a per-token model on a checkpoint without the table must not load."""
+    from vllm.model_executor.model_loader.utils import process_weights_after_loading
+
+    module = _per_token()
+    module.load_weights(_NGRAM_CHECKPOINT_TENSORS)  # table absent
+    assert not module.table_loaded
+    model_config = _model_config()
+    with pytest.raises(ValueError, match="per_token_table.weight"):
+        process_weights_after_loading(module, model_config, torch.device("cpu"))
+    with pytest.raises(ValueError, match="per_token_table.weight"):
+        module.quant_method.process_weights_after_loading(module)
+
+
+def test_per_token_present_table_passes_post_load_check() -> None:
+    from vllm.model_executor.model_loader.utils import process_weights_after_loading
+
+    module = _per_token()
+    module.load_weights([("per_token_table.weight", _table())])
+    assert module.table_loaded
+    process_weights_after_loading(
+        module,
+        _model_config(),
+        torch.device("cpu"),
+    )
+
+
+@pytest.mark.parametrize("mode", ["zero"])
+def test_zero_mode_has_no_post_load_check(mode: str) -> None:
+    module = _per_token(mode)
+    assert not hasattr(module, "quant_method")
+    module.check_table_loaded()  # no-op
