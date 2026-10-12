@@ -607,12 +607,25 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     swa_metadata.slot_mapping,
                     swa_metadata.block_table,
                 )
+                # Compressed id of each position's current token (per_token
+                # replacement mode only; image sentinels map to id 0).
+                engram_comp_ids = None
+                if any(
+                    getattr(getattr(layer, "engram", None), "replacement", None)
+                    is not None
+                    and layer.engram.replacement.mode == "per_token"
+                    for layer in islice(self.layers, self.start_layer, self.end_layer)
+                ):
+                    engram_comp_ids = self.engram_hash.token_map[
+                        torch.where(image_mask, 0, input_ids).long()
+                    ].long()
                 # Gather all Engram rows before entering the decoder layers.
                 for layer in islice(self.layers, self.start_layer, self.end_layer):
                     engram = getattr(layer, "engram", None)
                     if engram is not None:
                         engram.prepare_embeddings(
-                            engram_hashes[:, engram.layer_hash_index]
+                            engram_hashes[:, engram.layer_hash_index],
+                            engram_comp_ids,
                         )
 
         full_num_tokens = positions.shape[0]

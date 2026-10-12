@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from typing import TYPE_CHECKING, Self
+from typing import TYPE_CHECKING, Literal, Self
 
 from pydantic import model_validator
 
@@ -49,10 +49,35 @@ class EngramConfig:
     the other settings allow it, falling back to per-replica tables when DP
     replicas are not co-located on one node or /dev/shm cannot hold them."""
 
+    mode: Literal["ngram", "zero", "global_mean", "per_token"] = "ngram"
+    """What the Engram table lookup returns. ``ngram``: the checkpoint table
+    (default, unchanged behaviour). Experimental replacements of ONLY the lookup
+    output (everything downstream -- wkv, gate, norms, residual add -- still runs):
+    ``zero`` returns zeros; ``global_mean`` returns a fixed [n_hash_cols, head_dim]
+    vector per Engram layer; ``per_token`` returns a row looked up by the compressed
+    id of the current token. Non-``ngram`` modes load no table (use a table-less
+    checkpoint directory) and require ``replacement_tables`` for the mean modes."""
+
+    replacement_tables: str | None = None
+    """Directory with ``global_mean_L<layer>.npy`` (float32 [n_hash_cols, head_dim])
+    and ``U_L<layer>_bf16.npy`` (uint16 view of bf16 [compressed_vocab, n_hash_cols,
+    head_dim]) for the ``global_mean`` / ``per_token`` modes."""
+
     use_thp: bool = False
     """Back private CPU-offloaded tables with transparent huge pages (best
     effort, falls back to ordinary pinned pages). Prefaulting the tables at
     startup takes longer. Requires cpu_offload without dp_shared_memory."""
+
+    @model_validator(mode="after")
+    def _validate_mode(self) -> Self:
+        if self.mode in ("global_mean", "per_token") and not self.replacement_tables:
+            raise ValueError(f"engram mode {self.mode!r} requires replacement_tables")
+        if self.mode != "ngram" and (self.embedding_across_dp or self.dp_shared_memory or self.use_thp):
+            raise ValueError(
+                "engram replacement modes keep a tiny per-rank table: embedding_across_dp, "
+                "dp_shared_memory and use_thp must be off"
+            )
+        return self
 
     @model_validator(mode="after")
     def _validate_shared_memory(self) -> Self:
@@ -85,7 +110,8 @@ class EngramConfig:
         """Share host tables by default wherever the configuration permits."""
         if self.dp_shared_memory is None:
             self.dp_shared_memory = (
-                self.cpu_offload
+                self.mode == "ngram"
+                and self.cpu_offload
                 and not self.use_thp
                 and parallel_config.data_parallel_size > 1
                 and not parallel_config.enable_elastic_ep
