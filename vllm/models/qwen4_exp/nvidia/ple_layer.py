@@ -11,6 +11,7 @@ from transformers import Qwen4ExpTextConfig
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import CacheConfig, ModelConfig, VllmConfig, get_current_vllm_config
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import MergedColumnParallelLinear
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.layers.mamba.mamba_utils import (
@@ -25,7 +26,15 @@ from vllm.v1.attention.backends.short_conv_attn import (
 )
 
 from ..common.ops.ple import ple_conv, ple_gate
+from ..common.ple_mode import (
+    PLE_EMBEDDING_MODE_NGRAM,
+    PLE_EMBEDDING_MODE_PER_TOKEN,
+    validate_ple_embedding_config,
+)
+from ..common.ple_per_token import Qwen4ExpPerTokenEmbedding
 from .ngram_embedding import Qwen4ExpNGramEmbedding
+
+logger = init_logger(__name__)
 
 
 class Qwen4ExpPLEGroupedNorm(nn.Module):
@@ -91,15 +100,38 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         self.conv_state_len = (self.conv_kernel_size - 1) * self.short_conv_dilation
         self.num_spec_tokens = vllm_config.num_speculative_tokens
         self.activation = "silu"
-        self.ple_embedding = Qwen4ExpNGramEmbedding(
-            config,
-            int(config.ple_embed_dim),
-            self.ple_dense_layer_id,
-            vllm_config.scheduler_config.max_num_batched_tokens,
-            data_parallel_rank=vllm_config.parallel_config.data_parallel_rank,
-            prefix=f"{prefix}.ple_embedding",
-            quant_config=quant_config,
-            params_dtype=model_config.dtype,
+        self.ple_embedding_mode = validate_ple_embedding_config(config)
+        self.ple_embedding: nn.Module
+        if self.ple_embedding_mode == PLE_EMBEDDING_MODE_NGRAM:
+            self.ple_embedding = Qwen4ExpNGramEmbedding(
+                config,
+                int(config.ple_embed_dim),
+                self.ple_dense_layer_id,
+                vllm_config.scheduler_config.max_num_batched_tokens,
+                data_parallel_rank=vllm_config.parallel_config.data_parallel_rank,
+                prefix=f"{prefix}.ple_embedding",
+                quant_config=quant_config,
+                params_dtype=model_config.dtype,
+            )
+            table_rows = int(self.ple_embedding.ngram_embedding.org_vocab_size)
+        else:
+            self.ple_embedding = Qwen4ExpPerTokenEmbedding(
+                config,
+                int(config.ple_embed_dim),
+                self.ple_embedding_mode,
+                params_dtype=model_config.dtype,
+            )
+            table_rows = (
+                int(self.ple_embedding.vocab_size)
+                if self.ple_embedding_mode == PLE_EMBEDDING_MODE_PER_TOKEN
+                else 0
+            )
+        logger.info(
+            "PLE mode=%s ple_embedding_mode=%s table_rows=%d layer=%s",
+            self.ple_embedding_mode,
+            self.ple_embedding_mode,
+            table_rows,
+            prefix,
         )
         # The PLE cache is TP-replicated, so this merged projection is too.
         self.kv_proj = MergedColumnParallelLinear(
@@ -144,6 +176,8 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         output_dtype: torch.dtype,
     ) -> torch.Tensor:
         """Dequantize PLE lookup output."""
+        if isinstance(self.ple_embedding, Qwen4ExpPerTokenEmbedding):
+            return self.ple_embedding.dequantize(embeddings, output_dtype)
         return self.ple_embedding.ngram_embedding.dequantize(
             embeddings,
             output_dtype,
@@ -157,6 +191,9 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         ngram_context: torch.Tensor,
     ) -> None:
         """Start the pinned PLE lookup while the preceding decoder layer runs."""
+        if self.ple_embedding_mode != PLE_EMBEDDING_MODE_NGRAM:
+            # per_token / zero: GPU-resident table or no table; nothing to prefetch.
+            return
         self.ple_embedding.start_prefetch(
             hidden_states,
             input_ids,
@@ -402,12 +439,15 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
                 f"token length, got {input_ids.shape[0]} and "
                 f"{hidden_states.shape[0]}"
             )
-        embeddings = self.ple_embedding(
-            hidden_states,
-            input_ids,
-            query_start_loc,
-            ngram_context,
-        )
+        if self.ple_embedding_mode == PLE_EMBEDDING_MODE_NGRAM:
+            embeddings = self.ple_embedding(
+                hidden_states,
+                input_ids,
+                query_start_loc,
+                ngram_context,
+            )
+        else:
+            embeddings = self.ple_embedding(input_ids)
         embeddings = self._dequantize_embeddings(embeddings, hidden_states.dtype)
         kv, _ = self.kv_proj(embeddings)
         key, value = kv.split(self.kv_proj.output_sizes, dim=-1)

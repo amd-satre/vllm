@@ -105,6 +105,7 @@ from ..common.engram import (
     can_share_engram_tables,
     gather_engram_hashes,
 )
+from ..common.engram_modes import per_token_comp_ids
 from ..common.mm_preprocess import IMAGE_SENTINEL_BASE_ID, image_sentinel_mask
 from .ops.mhc import (
     MHC_OVERLAP_MAX_TOKENS,
@@ -305,12 +306,6 @@ class DeepseekV4DecoderLayer(nn.Module):
         if engram_layout is not None:
             layer_id = extract_layer_index(prefix)
             if layer_id in engram_layout.layer_ids:
-                engram_cfg = vllm_config.engram_config
-                if engram_cfg is not None and engram_cfg.mode != "ngram":
-                    raise NotImplementedError(
-                        "Engram replacement modes are only implemented for the "
-                        "AMD DeepSeek-V4.1 model"
-                    )
                 self.engram = Engram(
                     config,
                     vllm_config.quant_config,
@@ -897,6 +892,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         # profile runs (KV cache unbound).
         engram_hashes: torch.Tensor | None = None
         engram_mask: torch.Tensor | None = None
+        engram_comp_ids: torch.Tensor | None = None
         if (
             self.engram_hash is not None
             and input_ids is not None
@@ -935,6 +931,19 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     swa_metadata.slot_mapping,
                     swa_metadata.block_table,
                 )
+                # Compressed id of each position's current token (per_token
+                # replacement mode only; image sentinels map to id 0).
+                engram_comp_ids = per_token_comp_ids(
+                    (
+                        getattr(layer, "engram", None)
+                        for layer in islice(
+                            self.layers, self.start_layer, self.end_layer
+                        )
+                    ),
+                    self.engram_hash.token_map,
+                    input_ids,
+                    image_mask,
+                )
             elif not self.engram_dp_shared_memory and get_engram_dp_size() > 1:
                 # DP-sharded lookups are collective, so a replica skipping the
                 # hash still has to reach them.
@@ -949,7 +958,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     engram = getattr(layer, "engram", None)
                     if engram is not None:
                         engram.prepare_embeddings(
-                            gathered_hashes[:, engram.layer_hash_index]
+                            gathered_hashes[:, engram.layer_hash_index],
+                            engram_comp_ids,
                         )
 
         full_num_tokens = positions.shape[0]

@@ -286,6 +286,26 @@ def test_ngram_mode_rejects_per_token_checkpoint_tensor(monkeypatch) -> None:
         module.load_weights([("per_token_table.weight", _table())])
 
 
+def test_per_token_embedding_is_shared_by_amd_and_nvidia_layers() -> None:
+    # The NVIDIA module is read as text: importing it initializes platform
+    # state that breaks later device-less tests in the same process.
+    import importlib.util
+
+    from vllm.models.qwen4_exp.common import ple_per_token
+
+    assert (
+        amd_ple_layer.Qwen4ExpPerTokenEmbedding
+        is ple_per_token.Qwen4ExpPerTokenEmbedding
+    )
+    spec = importlib.util.find_spec("vllm.models.qwen4_exp.nvidia.ple_layer")
+    assert spec is not None and spec.origin is not None
+    with open(spec.origin) as f:
+        src = f.read()
+    assert "from ..common.ple_per_token import Qwen4ExpPerTokenEmbedding" in src
+    assert "validate_ple_embedding_config(config)" in src
+    assert "PLE_EMBEDDING_MODE_NGRAM" in src
+
+
 def test_layer_selects_embedding_class_by_mode() -> None:
     assert amd_ple_layer.Qwen4ExpPerTokenEmbedding is not (
         amd_ple_layer.Qwen4ExpNGramEmbedding

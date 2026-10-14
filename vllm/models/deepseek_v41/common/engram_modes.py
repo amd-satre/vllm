@@ -12,6 +12,7 @@ CPU.
 """
 
 import os
+from collections.abc import Iterable
 
 import numpy as np
 import torch
@@ -101,3 +102,19 @@ class EngramReplacement(nn.Module):
         else:
             assert comp_ids is not None and comp_ids.shape[0] == rows.shape[0]
             torch.index_select(self.U, 0, comp_ids, out=rows)
+
+
+def per_token_comp_ids(
+    engrams: Iterable[object],
+    token_map: torch.Tensor,
+    input_ids: torch.Tensor,
+    image_mask: torch.Tensor,
+) -> torch.Tensor | None:
+    """Compressed id of every position's current token, or None when no Engram
+    layer is in ``per_token`` mode. Image-span sentinels map to id 0."""
+    if not any(
+        getattr(getattr(e, "replacement", None), "mode", None) == "per_token"
+        for e in engrams
+    ):
+        return None
+    return token_map[torch.where(image_mask, 0, input_ids).long()].long()

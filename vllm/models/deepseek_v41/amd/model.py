@@ -66,6 +66,7 @@ from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 
 from ..common.engram import Engram, EngramLayout, NgramHashState
+from ..common.engram_modes import per_token_comp_ids
 from ..common.mm_preprocess import IMAGE_SENTINEL_BASE_ID, image_sentinel_mask
 
 if typing.TYPE_CHECKING:
@@ -609,16 +610,17 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 )
                 # Compressed id of each position's current token (per_token
                 # replacement mode only; image sentinels map to id 0).
-                engram_comp_ids = None
-                if any(
-                    getattr(getattr(layer, "engram", None), "replacement", None)
-                    is not None
-                    and layer.engram.replacement.mode == "per_token"
-                    for layer in islice(self.layers, self.start_layer, self.end_layer)
-                ):
-                    engram_comp_ids = self.engram_hash.token_map[
-                        torch.where(image_mask, 0, input_ids).long()
-                    ].long()
+                engram_comp_ids = per_token_comp_ids(
+                    (
+                        getattr(layer, "engram", None)
+                        for layer in islice(
+                            self.layers, self.start_layer, self.end_layer
+                        )
+                    ),
+                    self.engram_hash.token_map,
+                    input_ids,
+                    image_mask,
+                )
                 # Gather all Engram rows before entering the decoder layers.
                 for layer in islice(self.layers, self.start_layer, self.end_layer):
                     engram = getattr(layer, "engram", None)

@@ -101,3 +101,21 @@ def test_zero_lookup_leaves_residual_untouched():
         gate, torch.full_like(gate, 0.5), atol=1e-3
     )
     assert torch.equal(out, h)
+
+
+def test_per_token_comp_ids_only_when_a_layer_uses_per_token():
+    from types import SimpleNamespace as NS
+
+    token_map = torch.arange(100, 0, -1)  # token t -> compressed id 100 - t
+    ids = torch.tensor([3, 0, 7, 5])
+    image = torch.tensor([False, False, True, False])  # position 2 is an image sentinel
+    eng = lambda mode: NS(replacement=NS(mode=mode))  # noqa: E731
+    out = em.per_token_comp_ids([eng("per_token"), None], token_map, ids, image)
+    assert out.dtype == torch.int64
+    assert out.tolist() == [97, 100, 100, 95]  # sentinel position maps through id 0
+    assert em.per_token_comp_ids([eng("zero"), None], token_map, ids, image) is None
+    assert (
+        em.per_token_comp_ids([NS(replacement=None), None], token_map, ids, image)
+        is None
+    )
+    assert em.per_token_comp_ids(iter([]), token_map, ids, image) is None
