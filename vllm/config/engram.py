@@ -56,7 +56,8 @@ class EngramConfig:
     ``zero`` returns zeros; ``global_mean`` returns a fixed [n_hash_cols, head_dim]
     vector per Engram layer; ``per_token`` returns a row looked up by the compressed
     id of the current token. Non-``ngram`` modes load no table (use a table-less
-    checkpoint directory) and require ``replacement_tables`` for the mean modes."""
+    checkpoint directory); ``global_mean`` and ``per_token`` require
+    ``replacement_tables`` (ignored by ``ngram`` and ``zero``)."""
 
     replacement_tables: str | None = None
     """Directory with ``global_mean_L<layer>.npy`` (float32 [n_hash_cols, head_dim])
@@ -72,10 +73,12 @@ class EngramConfig:
     def _validate_mode(self) -> Self:
         if self.mode in ("global_mean", "per_token") and not self.replacement_tables:
             raise ValueError(f"engram mode {self.mode!r} requires replacement_tables")
-        if self.mode != "ngram" and (self.embedding_across_dp or self.dp_shared_memory or self.use_thp):
+        if self.mode != "ngram" and (
+            self.embedding_across_dp or self.dp_shared_memory or self.use_thp
+        ):
             raise ValueError(
-                "engram replacement modes keep a tiny per-rank table: embedding_across_dp, "
-                "dp_shared_memory and use_thp must be off"
+                "engram replacement modes keep their tables on each rank's GPU: "
+                "embedding_across_dp, dp_shared_memory and use_thp must be off"
             )
         return self
 

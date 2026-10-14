@@ -1356,7 +1356,8 @@ class Engram(nn.Module):
         if self._mode == "ngram":
             self.embed_tokens = self._create_embedding(layout, layer_hash_index)
         else:
-            # Replacement modes load no table: this stand-in only carries the shard geometry.
+            # Replacement modes load no table: this stand-in only carries the
+            # shard geometry.
             self.embed_tokens = ReplacementShardInfo(
                 n_hash_cols,
                 layout.head_dim,
@@ -1432,7 +1433,8 @@ class Engram(nn.Module):
         """Look up, or prefetch from host memory, rows before the decoder layers
         consume them; DP-sharded tables take the group's gathered hash IDs.
         In replacement modes ``rows`` is filled from the stand-in instead
-        (``comp_ids``: compressed id of each position's current token, per_token only)."""
+        (``comp_ids``: compressed id of each position's current token,
+        per_token only)."""
         rows = self.staged_rows[: hash_ids.shape[0]]
         assert rows.shape[0] == hash_ids.shape[0], "engram staging buffer too small"
         if self.replacement is not None:

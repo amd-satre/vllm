@@ -305,6 +305,12 @@ class DeepseekV4DecoderLayer(nn.Module):
         if engram_layout is not None:
             layer_id = extract_layer_index(prefix)
             if layer_id in engram_layout.layer_ids:
+                engram_cfg = vllm_config.engram_config
+                if engram_cfg is not None and engram_cfg.mode != "ngram":
+                    raise NotImplementedError(
+                        "Engram replacement modes are only implemented for the "
+                        "AMD DeepSeek-V4.1 model"
+                    )
                 self.engram = Engram(
                     config,
                     vllm_config.quant_config,
