@@ -3,6 +3,8 @@
 
 import logging
 import os
+import warnings
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from itertools import accumulate
 from pathlib import Path
@@ -26,7 +28,9 @@ import vllm.utils.gpu_sync_debug as gpu_sync_debug
 from tests.v1.attention.utils import BatchSpec, create_common_attn_metadata
 from vllm.config import (
     EngramConfig,
+    LoadConfig,
     ModelConfig,
+    SchedulerConfig,
     SpeculativeConfig,
     VllmConfig,
     set_current_vllm_config,
@@ -56,6 +60,9 @@ from vllm.model_executor.layers.quantization.modelopt import (
 from vllm.model_executor.layers.quantization.online.base import OnlineQuantizationConfig
 from vllm.model_executor.layers.quantization.quark.quark import QuarkConfig
 from vllm.model_executor.model_loader.reload.inplace import reload_weights
+from vllm.model_executor.model_loader.weight_utils import safetensors_weights_iterator
+from vllm.models.qwen4_exp.amd import disk_offload as amd_disk_offload
+from vllm.models.qwen4_exp.amd import model_state as amd_model_state
 from vllm.models.qwen4_exp.amd import ple_layer as amd_ple_layer
 from vllm.models.qwen4_exp.amd.ple_layer import (
     Qwen4ExpPLELayer as Qwen4ExpPLELayerAMD,
@@ -89,6 +96,8 @@ from vllm.v1.attention.backends.short_conv_attn import (
 )
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.v1.kv_cache_interface import MambaSpec
+from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
+from vllm.v1.worker.gpu.states import RequestState
 
 
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
@@ -2797,14 +2806,18 @@ def test_fused_gate_correctness(num_tokens: int, strided_kv: bool) -> None:
     torch.testing.assert_close(normed, expected_normed, atol=1e-2, rtol=1e-2)
 
 
-def _build_amd_ngram_embedding(
+def _make_amd_ngram_embedding(
     monkeypatch: pytest.MonkeyPatch,
     *,
     device: str,
-    cpu_offload: bool,
+    engram_config: EngramConfig,
     fp8_checkpoint: bool,
-) -> tuple[amd_ple_layer.Qwen4ExpNGramEmbedding, torch.Tensor]:
-    """Construct and load a small AMD embedding through its checkpoint loader."""
+    load_format: str = "auto",
+    max_total_tokens: int = 4,
+    use_sequence_parallel: bool = False,
+    **text_config: int,
+) -> amd_ple_layer.Qwen4ExpNGramEmbedding:
+    """Construct a small AMD embedding without loading any weights."""
     _mock_etp_group(monkeypatch)
     monkeypatch.setattr(embedding_module, "get_tensor_model_parallel_rank", lambda: 0)
     monkeypatch.setattr(
@@ -2815,31 +2828,51 @@ def _build_amd_ngram_embedding(
         parameter_module, "get_tensor_model_parallel_world_size", lambda: 1
     )
 
-    vllm_config = VllmConfig()
-    vllm_config.engram_config = EngramConfig(cpu_offload=cpu_offload)
+    vllm_config = VllmConfig(load_config=LoadConfig(load_format=load_format))
+    vllm_config.engram_config = engram_config
     config = Qwen4ExpTextConfig(
-        ngram_size=3,
-        heads_per_ngram=1,
-        ngram_vocab_size_base=5,
-        make_ngram_vocab_size_divisible_by=8,
-        split_ngram_parts=2,
-        ple_embed_dim=6,
-        eos_token_id=0,
-        vocab_size=64,
+        **{
+            "ngram_size": 3,
+            "heads_per_ngram": 1,
+            "ngram_vocab_size_base": 5,
+            "make_ngram_vocab_size_divisible_by": 8,
+            "split_ngram_parts": 2,
+            "ple_embed_dim": 6,
+            "eos_token_id": 0,
+            "vocab_size": 64,
+            **text_config,
+        }
     )
     with set_current_vllm_config(vllm_config), torch.device(device):
-        module = amd_ple_layer.Qwen4ExpNGramEmbedding(
+        return amd_ple_layer.Qwen4ExpNGramEmbedding(
             config,
             embedding_dim=config.ple_embed_dim,
             ple_dense_layer_id=0,
-            max_total_tokens=4,
+            max_total_tokens=max_total_tokens,
             prefix="test.ple_embedding",
             layer_name="test.ple",
             quant_config=(
                 Fp8Config(is_checkpoint_fp8_serialized=True) if fp8_checkpoint else None
             ),
             params_dtype=torch.bfloat16,
+            use_sequence_parallel=use_sequence_parallel,
         )
+
+
+def _build_amd_ngram_embedding(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    device: str,
+    cpu_offload: bool,
+    fp8_checkpoint: bool,
+) -> tuple[amd_ple_layer.Qwen4ExpNGramEmbedding, torch.Tensor]:
+    """Construct and load a small AMD embedding through its checkpoint loader."""
+    module = _make_amd_ngram_embedding(
+        monkeypatch,
+        device=device,
+        engram_config=EngramConfig(cpu_offload=cpu_offload),
+        fp8_checkpoint=fp8_checkpoint,
+    )
     # Only the outer owner is a stub; the embedding constructor and loader run.
     layer = Qwen4ExpPLELayerAMD.__new__(Qwen4ExpPLELayerAMD)
     nn.Module.__init__(layer)
@@ -3062,3 +3095,521 @@ def test_amd_ngram_embedding_matches_reference_under_compile(
     )
     expected = loaded_weight[ngram_ids.cpu()].flatten(-2).to(device)
     torch.testing.assert_close(output.float(), expected.float(), rtol=0, atol=0)
+
+
+# Two heads of 129 values: 208 rows in five shards (the last one uneven), and rows
+# that do not align with pages.
+_DISK_TABLE = {
+    "ngram_size": 3,
+    "heads_per_ngram": 1,
+    "ngram_vocab_size_base": 100,
+    "make_ngram_vocab_size_divisible_by": 8,
+    "split_ngram_parts": 5,
+    "ple_embed_dim": 2 * 129,
+    "eos_token_id": 0,
+    "vocab_size": 64,
+}
+_DISK_ROWS = 208
+_DISK_SHARD_ROWS = 42
+
+
+def _make_disk_offload_embedding(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    fp8_checkpoint: bool = False,
+    load_format: str = "auto",
+    device: str = "cpu",
+) -> amd_ple_layer.Qwen4ExpNGramEmbedding:
+    """Construct a small disk-offload embedding that holds no table rows."""
+    module = _make_amd_ngram_embedding(
+        monkeypatch,
+        device=device,
+        engram_config=EngramConfig(disk_offload=True, cpu_offload=False),
+        fp8_checkpoint=fp8_checkpoint,
+        load_format=load_format,
+        max_total_tokens=128,
+        **_DISK_TABLE,
+    )
+    embedding = module.ngram_embedding
+    assert isinstance(embedding, amd_disk_offload.Qwen4ExpPLEDiskOffloadEmbedding)
+    assert embedding.weight.numel() == 0
+    assert embedding.org_vocab_size == _DISK_ROWS
+    return module
+
+
+def _save_amd_checkpoint(
+    directory: Path,
+    module: amd_ple_layer.Qwen4ExpNGramEmbedding,
+    *,
+    sharded: bool,
+    files: int = 1,
+    dtype: torch.dtype | None = None,
+    seed: int = 0,
+) -> torch.Tensor:
+    """Write a random table to `files` safetensors files of `directory`.
+
+    The table is stored as checkpoint shards or as one tensor. Returns the table.
+    """
+    embedding = module.ngram_embedding
+    table = torch.randn(
+        embedding.org_vocab_size,
+        embedding.embedding_dim,
+        generator=torch.Generator().manual_seed(seed),
+    ).to(dtype or embedding.weight.dtype)
+    tensors = (
+        {
+            f"ngram_embedding.shard_{i}.weight": shard.clone()
+            for i, shard in enumerate(table.split(_DISK_SHARD_ROWS))
+        }
+        if sharded
+        else {"ngram_embedding.weight": table}
+    )
+    if embedding.weight.dtype == torch.float8_e4m3fn:
+        tensors["ngram_embedding.weight_scale"] = torch.tensor([0.25])
+    directory.mkdir(exist_ok=True)
+    names = list(tensors)
+    for i in range(files):
+        chunk = {name: tensors[name] for name in names[i::files]}
+        save_file(chunk, directory / f"model-{i}.safetensors")
+    return table
+
+
+_Corrupt = Callable[[dict[str, torch.Tensor]], list[tuple[str, torch.Tensor]]]
+
+
+def _load_amd_checkpoint(
+    module: amd_ple_layer.Qwen4ExpNGramEmbedding,
+    directory: Path,
+    corrupt: _Corrupt | None = None,
+) -> set[str]:
+    """Load the files of `directory` the way the default loader does: as mmap views."""
+    files = [str(path) for path in sorted(directory.glob("*.safetensors"))]
+    weights = safetensors_weights_iterator(files, use_tqdm_on_load=False)
+    loaded = module.load_weights(weights if corrupt is None else corrupt(dict(weights)))
+    embedding = module.ngram_embedding
+    embedding.quant_method.process_weights_after_loading(embedding)
+    return loaded
+
+
+@pytest.mark.parametrize(
+    ("sharded", "files"),
+    [(True, 1), (False, 1), (True, 2)],
+    ids=["sharded", "unsharded", "sharded-two-files"],
+)
+@pytest.mark.parametrize("fp8_checkpoint", [False, True], ids=["bf16", "fp8"])
+def test_amd_disk_offload_stages_the_rows_of_a_resident_table(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    sharded: bool,
+    files: int,
+    fp8_checkpoint: bool,
+) -> None:
+    """Rows read from the checkpoint files equal the rows of a resident table."""
+    disk = _make_disk_offload_embedding(monkeypatch, fp8_checkpoint=fp8_checkpoint)
+    resident = _make_amd_ngram_embedding(
+        monkeypatch,
+        device="cpu",
+        engram_config=EngramConfig(cpu_offload=False),
+        fp8_checkpoint=fp8_checkpoint,
+        **_DISK_TABLE,
+    )
+    _save_amd_checkpoint(tmp_path, disk, sharded=sharded, files=files)
+    expected_names = {"ngram_embedding.weight"}
+    if fp8_checkpoint:
+        expected_names.add("ngram_embedding.weight_scale")
+    assert _load_amd_checkpoint(disk, tmp_path) == expected_names
+    assert _load_amd_checkpoint(resident, tmp_path) == expected_names
+
+    shard_starts = range(_DISK_SHARD_ROWS, _DISK_ROWS, _DISK_SHARD_ROWS)
+    steps = [
+        torch.cat(
+            [
+                # Every row once, in order.
+                torch.arange(_DISK_ROWS).reshape(-1, 2),
+                # The first and last rows, both sides of each shard boundary, and
+                # ids repeated across heads and tokens.
+                torch.tensor(
+                    [[0, _DISK_ROWS - 1], [_DISK_ROWS - 1, 0], [7, 7], [7, 7]]
+                ),
+                torch.tensor([(s - 1, s) for s in shard_starts]),
+                torch.tensor([(s, s - 1) for s in shard_starts]),
+            ]
+        ),
+        torch.tensor([[200, 5], [5, 200], [100, 100]]),
+        torch.empty(0, 2, dtype=torch.long),
+    ]
+    embedding = disk.ngram_embedding
+    for ids in steps:
+        num_tokens = len(ids)
+        embedding.copy_ids_to_host(ids)
+        embedding.stage_rows(num_tokens)
+        staged = disk(
+            torch.zeros(num_tokens, dtype=torch.int32),
+            torch.tensor([0, num_tokens], dtype=torch.int32),
+            torch.zeros(1, 2, dtype=torch.int32),
+        )
+        expected = resident.ngram_embedding(ids).flatten(-2)
+        assert staged.shape == (num_tokens, disk.embedding_dim)
+        assert torch.equal(staged.view(torch.uint8), expected.view(torch.uint8))
+
+
+@pytest.mark.parametrize(
+    ("sharded", "corrupt", "error"),
+    [
+        pytest.param(
+            True,
+            lambda t: [(k, v.clone()) for k, v in t.items()],
+            "not a file-backed view",
+            id="sharded-copied",
+        ),
+        pytest.param(
+            True,
+            lambda t: [(k, v) for k, v in t.items() if "shard_2" not in k],
+            f"cover {_DISK_ROWS - _DISK_SHARD_ROWS} of {_DISK_ROWS} rows",
+            id="missing-shard",
+        ),
+        pytest.param(
+            True,
+            lambda t: [
+                *t.items(),
+                ("ngram_embedding.shard_0.weight", t["ngram_embedding.shard_0.weight"]),
+            ],
+            "Duplicate PLE weight shard 0",
+            id="duplicate-shard",
+        ),
+        pytest.param(
+            True,
+            lambda t: [(k, v[:-1]) for k, v in t.items()],
+            "Shape mismatch for PLE embedding shard 0",
+            id="wrong-shard-shape",
+        ),
+        pytest.param(
+            False,
+            lambda t: [(k, v[:-1]) for k, v in t.items()],
+            "Shape mismatch for the unsharded PLE embedding",
+            id="wrong-unsharded-rows",
+        ),
+    ],
+)
+def test_amd_disk_offload_rejects_checkpoints_it_cannot_serve(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    sharded: bool,
+    corrupt: _Corrupt,
+    error: str,
+) -> None:
+    """A table that cannot be served from the files is rejected while loading."""
+    module = _make_disk_offload_embedding(monkeypatch)
+    _save_amd_checkpoint(tmp_path, module, sharded=sharded)
+    with pytest.raises(ValueError, match=error):
+        _load_amd_checkpoint(module, tmp_path, corrupt)
+
+
+def test_amd_disk_offload_rejects_a_table_of_another_dtype(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Rows are served as stored, so the checkpoint must match `--dtype`."""
+    module = _make_disk_offload_embedding(monkeypatch)
+    _save_amd_checkpoint(tmp_path, module, sharded=True, dtype=torch.float16)
+    with pytest.raises(
+        ValueError, match="torch.float16 must match the embedding dtype"
+    ):
+        _load_amd_checkpoint(module, tmp_path)
+
+
+def _load_disk_offload_embedding(
+    monkeypatch: pytest.MonkeyPatch, directory: Path
+) -> amd_ple_layer.Qwen4ExpNGramEmbedding:
+    """Load a sharded checkpoint written to `directory` into a disk-offload layer."""
+    module = _make_disk_offload_embedding(monkeypatch)
+    _save_amd_checkpoint(directory, module, sharded=True)
+    _load_amd_checkpoint(module, directory)
+    return module
+
+
+def test_amd_disk_offload_fails_closed_on_a_truncated_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A file cut short after loading raises instead of staging stale rows."""
+    embedding = _load_disk_offload_embedding(monkeypatch, tmp_path).ngram_embedding
+    embedding.copy_ids_to_host(torch.tensor([[0, _DISK_ROWS - 1]]))
+    embedding.stage_rows(1)
+
+    path = tmp_path / "model-0.safetensors"
+    os.truncate(path, path.stat().st_size - 4)
+
+    with pytest.raises(ValueError, match="truncated at offset"):
+        embedding.stage_rows(1)
+
+
+def test_amd_disk_offload_rejects_reloading_weights(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Rows are bound to the first checkpoint, so loading weights again raises."""
+    module = _load_disk_offload_embedding(monkeypatch, tmp_path)
+    shard = torch.zeros(
+        _DISK_SHARD_ROWS, module.ngram_embedding.embedding_dim, dtype=torch.bfloat16
+    )
+    with pytest.raises(RuntimeError, match="does not support weight reload"):
+        module.load_weights([("ngram_embedding.shard_0.weight", shard)])
+
+
+@pytest.mark.parametrize("bad_id", [-1, _DISK_ROWS], ids=["negative", "past-the-end"])
+def test_amd_disk_offload_rejects_out_of_range_ids(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, bad_id: int
+) -> None:
+    """An id outside the table raises instead of reading a neighbouring row."""
+    module = _load_disk_offload_embedding(monkeypatch, tmp_path)
+    embedding = module.ngram_embedding
+    embedding.copy_ids_to_host(torch.tensor([[3, bad_id]]))
+    with pytest.raises(IndexError, match="out of range"):
+        embedding.stage_rows(1)
+
+
+def test_amd_disk_offload_rejects_unbound_rows(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Rows cannot be staged before a checkpoint has been loaded."""
+    embedding = _make_disk_offload_embedding(monkeypatch).ngram_embedding
+    embedding.copy_ids_to_host(torch.tensor([[3, 4]]))
+    with pytest.raises(AssertionError, match="rows are not bound"):
+        embedding.stage_rows(1)
+
+
+def test_amd_disk_offload_dummy_load_format_serves_zeros(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`--load-format dummy` has no checkpoint files to bind and stages zeros."""
+    module = _make_disk_offload_embedding(monkeypatch, load_format="dummy")
+    embedding = module.ngram_embedding
+    embedding.quant_method.process_weights_after_loading(embedding)
+    embedding.copy_ids_to_host(torch.tensor([[3, 4], [_DISK_ROWS - 1, 0]]))
+    embedding.stage_rows(2)
+    staged = embedding.staged_rows(2)
+    assert staged.shape == (2, module.embedding_dim)
+    assert staged.dtype == torch.bfloat16
+    assert not staged.view(torch.uint8).any()
+
+
+@pytest.fixture
+def one_rank_parallel_state(tmp_path: Path) -> Iterator[None]:
+    """Real TP and ETP groups of one rank, which sequence parallelism needs."""
+    with set_current_vllm_config(VllmConfig()):
+        init_distributed_environment(
+            world_size=1,
+            rank=0,
+            distributed_init_method=f"file://{tmp_path / 'rendezvous'}",
+            local_rank=0,
+            backend="gloo",
+        )
+        initialize_model_parallel(1, 1)
+        yield
+    cleanup_dist_env_and_memory()
+
+
+@pytest.mark.parametrize(
+    ("engram_options", "device", "reduce_scatter"),
+    [
+        pytest.param({"cpu_offload": False}, "cpu", True, id="resident"),
+        pytest.param(
+            {"cpu_offload": True},
+            "cuda:0",
+            True,
+            id="pinned",
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(), reason="requires CUDA or ROCm"
+            ),
+        ),
+        pytest.param({"disk_offload": True}, "cpu", False, id="disk-offload"),
+    ],
+)
+def test_amd_disk_offload_does_not_reduce_scatter_under_sequence_parallel(
+    monkeypatch: pytest.MonkeyPatch,
+    one_rank_parallel_state: None,
+    engram_options: dict[str, bool],
+    device: str,
+    reduce_scatter: bool,
+) -> None:
+    """Disk-offload ranks stage full rows, so sequence parallelism only shards tokens.
+
+    A table split by vocabulary needs its partial rows reduce-scattered; summing
+    the full rows of every rank would multiply them.
+    """
+    module = _make_amd_ngram_embedding(
+        monkeypatch,
+        device=device,
+        engram_config=EngramConfig(**engram_options),
+        fp8_checkpoint=False,
+        use_sequence_parallel=True,
+    )
+    assert module.use_reduce_scatter is reduce_scatter
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA or ROCm")
+@pytest.mark.parametrize("fp8_checkpoint", [False, True], ids=["bf16", "fp8"])
+def test_amd_disk_offload_matches_resident_table_under_graph_replay(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, fp8_checkpoint: bool
+) -> None:
+    """A graph that reads the staged rows replays the rows of the current step."""
+    device = "cuda:0"
+    disk = _make_disk_offload_embedding(
+        monkeypatch, fp8_checkpoint=fp8_checkpoint, device=device
+    )
+    resident = _make_amd_ngram_embedding(
+        monkeypatch,
+        device=device,
+        engram_config=EngramConfig(cpu_offload=False),
+        fp8_checkpoint=fp8_checkpoint,
+        **_DISK_TABLE,
+    )
+    _save_amd_checkpoint(tmp_path, disk, sharded=True)
+    _load_amd_checkpoint(disk, tmp_path)
+    _load_amd_checkpoint(resident, tmp_path)
+
+    input_ids = torch.randint(1, 64, (8,), dtype=torch.int32, device=device)
+    query_start_loc = torch.tensor([0, 5, 8], dtype=torch.int32, device=device)
+    ngram_context = torch.tensor([[3, 4], [0, 0]], dtype=torch.int32, device=device)
+    monkeypatch.setattr(gpu_sync_debug, "_SYNC_CHECK_MODE", "error")
+    monkeypatch.setattr(gpu_sync_debug, "_sync_check_enabled", False)
+    gpu_sync_debug.enable_gpu_sync_check()
+    stage = with_gpu_sync_check(amd_disk_offload.stage_checkpoint_rows)
+
+    def read_staged_rows() -> torch.Tensor:
+        rows = disk(input_ids, query_start_loc, ngram_context)
+        return disk.ngram_embedding.dequantize(rows, torch.bfloat16).clone()
+
+    modules = [(disk, disk.ngram_embedding)]
+    stage(modules, input_ids, query_start_loc, ngram_context)
+    read_staged_rows()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = read_staged_rows()
+    for seed in range(2):
+        generator = torch.Generator().manual_seed(seed)
+        input_ids.copy_(
+            torch.randint(1, 64, (8,), dtype=torch.int32, generator=generator)
+        )
+        stage(modules, input_ids, query_start_loc, ngram_context)
+        graph.replay()
+        ngram_ids = disk.compute_ngram_ids(input_ids, query_start_loc, ngram_context)
+        rows = resident.ngram_embedding(ngram_ids).flatten(-2)
+        expected = resident.ngram_embedding.dequantize(rows, torch.bfloat16)
+        assert torch.equal(output.view(torch.uint8), expected.view(torch.uint8))
+
+
+def _make_amd_model_state(
+    tmp_path: Path,
+    layers: list[amd_ple_layer.Qwen4ExpNGramEmbedding],
+    device: torch.device,
+) -> amd_model_state.Qwen4ExpModelState:
+    """Construct the real AMD model state over `layers` from a saved tiny config."""
+    Qwen4ExpTextConfig(
+        architectures=["Qwen4ExpForCausalLM"], ple_layer_ids=[1], **_DISK_TABLE
+    ).save_pretrained(tmp_path / "hf")
+    vllm_config = VllmConfig(
+        model_config=ModelConfig(model=str(tmp_path / "hf"), max_model_len=64),
+        scheduler_config=SchedulerConfig(
+            is_encoder_decoder=False,
+            max_num_seqs=4,
+            max_num_batched_tokens=16,
+            max_model_len=64,
+        ),
+    )
+    # The layers sit below their decoder layer, as in a model.
+    model = nn.ModuleList([nn.ModuleList(layers)])
+    return amd_model_state.Qwen4ExpModelState(vllm_config, model, None, device)
+
+
+def test_amd_model_state_stages_only_disk_offload_layers(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A resident layer looks its rows up in the forward, so only disk ones stage."""
+    resident = _make_amd_ngram_embedding(
+        monkeypatch,
+        device="cpu",
+        engram_config=EngramConfig(cpu_offload=False),
+        fp8_checkpoint=False,
+        **_DISK_TABLE,
+    )
+    disk = _make_disk_offload_embedding(monkeypatch)
+    model_state = _make_amd_model_state(tmp_path, [resident, disk], torch.device("cpu"))
+    assert model_state.disk_offload_modules == [(disk, disk.ngram_embedding)]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA or ROCm")
+def test_amd_model_state_stages_disk_offload_rows_once_per_step(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`prepare_inputs` stages the rows of every disk-offload layer behind one sync."""
+    device = torch.device("cuda:0")
+    layers = [
+        _make_disk_offload_embedding(monkeypatch, device=str(device)) for _ in range(2)
+    ]
+    tables = []
+    for seed, layer in enumerate(layers):
+        directory = tmp_path / f"layer_{seed}"
+        tables.append(_save_amd_checkpoint(directory, layer, sharded=True, seed=seed))
+        _load_amd_checkpoint(layer, directory)
+    model_state = _make_amd_model_state(tmp_path, layers, device)
+    assert model_state.disk_offload_modules == [
+        (layer, layer.ngram_embedding) for layer in layers
+    ]
+
+    req_states = RequestState(
+        max_num_reqs=4,
+        max_model_len=64,
+        max_num_batched_tokens=16,
+        num_speculative_steps=0,
+        vocab_size=64,
+        device=device,
+        use_dense_all_token_ids=True,
+    )
+    req_states.add_request("a", 5, [11, 12, 13, 14, 15], 3, 8)
+    req_states.add_request("b", 4, [21, 22, 23, 24], 0, 8)
+    req_states.apply_staged_writes()
+    input_buffers = InputBuffers(4, 16, device)
+
+    def make_batch(tokens: list[int], req_ids: list[str]) -> InputBatch:
+        batch = InputBatch.make_dummy(len(req_ids), len(tokens), input_buffers)
+        batch.input_ids.copy_(torch.tensor(tokens, dtype=torch.int32))
+        batch.idx_mapping = torch.tensor(
+            [req_states.req_id_to_index[req_id] for req_id in req_ids], device=device
+        )
+        return batch
+
+    def count_gpu_syncs(fn: Callable[[], object]) -> int:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            torch.cuda.set_sync_debug_mode("warn")
+            try:
+                fn()
+            finally:
+                torch.cuda.set_sync_debug_mode("default")
+        return sum("synchronizing CUDA operation" in str(w.message) for w in caught)
+
+    monkeypatch.setattr(gpu_sync_debug, "_SYNC_CHECK_MODE", "error")
+    monkeypatch.setattr(gpu_sync_debug, "_sync_check_enabled", False)
+    gpu_sync_debug.enable_gpu_sync_check()
+    prepare_inputs = with_gpu_sync_check(model_state.prepare_inputs)
+    # A step that two requests share, then one request alone.
+    for tokens, req_ids in [
+        ([14, 15, 21, 22, 23], ["a", "b"]),
+        ([21, 22, 23, 24], ["b"]),
+    ]:
+        batch = make_batch(tokens, req_ids)
+        inputs = prepare_inputs(batch, req_states)
+        for layer, table in zip(layers, tables):
+            ngram_ids = _reference_ngram_ids(
+                batch.input_ids,
+                inputs["query_start_loc"],
+                inputs["ngram_context"],
+                layer.layer_multipliers,
+                layer.ngram_heads_vocab_sizes,
+                layer.ngram_heads_offsets,
+                layer.eos_token_id,
+                layer.heads_per_ngram,
+            )
+            staged = layer.ngram_embedding.staged_rows(batch.num_tokens).cpu()
+            expected = table[ngram_ids.cpu()].flatten(-2)
+            assert torch.equal(staged.view(torch.uint8), expected.view(torch.uint8))
+
+    assert count_gpu_syncs(torch.accelerator.current_stream().synchronize) == 1
+    assert count_gpu_syncs(lambda: model_state.prepare_inputs(batch, req_states)) == 1
