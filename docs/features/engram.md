@@ -113,21 +113,22 @@ vLLM fails fast when it is unavailable.
 is allocated in GPU or pinned host memory, and nothing is copied to an offload
 directory. Each step reads that step's rows from the safetensors files on the
 host. Use it where neither `cpu_offload` nor a resident table fits, for example
-on unified-memory GPUs such as DGX Spark, where pinned host memory comes out of
-the same pool as the weights and the KV cache:
+on unified-memory GPUs such as DGX Spark or AMD Strix Halo, where pinned host
+memory comes out of the same pool as the weights and the KV cache:
 
 ```bash
 vllm serve <qwen4exp-checkpoint> --engram-config '{"disk_offload": true}'
 ```
 
-It applies only to Qwen4Exp on CUDA and takes precedence over `cpu_offload`.
+It applies only to Qwen4Exp on CUDA and ROCm and takes precedence over
+`cpu_offload`.
 
 Rows are read with `preadv` and copied to fixed device buffers before the
 forward, so CUDA graphs replay unchanged. They stay in the checkpoint format
-(BF16, FP8 or NVFP4) and are decoded on the GPU, so an unquantized table must
-match `--dtype`. Rows that were read recently are served from the OS page
-cache, which is shared by co-located ranks, not counted in the worker's RSS,
-and reclaimed by the kernel under memory pressure.
+(BF16, FP8 or, on CUDA only, NVFP4) and are decoded on the GPU, so an
+unquantized table must match `--dtype`. Rows that were read recently are served
+from the OS page cache, which is shared by co-located ranks, not counted in the
+worker's RSS, and reclaimed by the kernel under memory pressure.
 
 Costs and limits:
 

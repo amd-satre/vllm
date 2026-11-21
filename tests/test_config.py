@@ -2590,23 +2590,28 @@ def test_engram_draft_config_validates_target(monkeypatch, target_has_ple, expli
 
 
 @pytest.mark.parametrize(
-    ("architecture", "layer_field", "rocm", "expect_error"),
+    ("architecture", "layer_field", "platform", "expect_error"),
     [
         pytest.param(
-            "DeepseekV41ForCausalLM", "engram_layer_ids", False, True, id="deepseek"
+            "DeepseekV41ForCausalLM", "engram_layer_ids", "cuda", True, id="deepseek"
         ),
         pytest.param(
-            "Qwen4ExpForCausalLM", "ple_layer_ids", True, True, id="qwen4exp_rocm"
+            "Qwen4ExpForCausalLM", "ple_layer_ids", "cpu", True, id="qwen4exp_cpu"
         ),
         pytest.param(
-            "Qwen4ExpForCausalLM", "ple_layer_ids", False, False, id="qwen4exp_cuda"
+            "Qwen4ExpForCausalLM", "ple_layer_ids", "rocm", False, id="qwen4exp_rocm"
+        ),
+        pytest.param(
+            "Qwen4ExpForCausalLM", "ple_layer_ids", "cuda", False, id="qwen4exp_cuda"
         ),
     ],
 )
-def test_engram_disk_offload_requires_cuda_qwen4exp(
-    monkeypatch, architecture, layer_field, rocm, expect_error
+def test_engram_disk_offload_requires_cuda_alike_qwen4exp(
+    monkeypatch, architecture, layer_field, platform, expect_error
 ):
-    monkeypatch.setattr(current_platform, "is_cuda", lambda: not rocm)
+    monkeypatch.setattr(
+        current_platform, "is_cuda_alike", lambda: platform in ("cuda", "rocm")
+    )
     model = cast(
         ModelConfig,
         SimpleNamespace(
@@ -2616,7 +2621,7 @@ def test_engram_disk_offload_requires_cuda_qwen4exp(
     )
     config = EngramConfig(disk_offload=True)
     if expect_error:
-        with pytest.raises(ValueError, match="disk_offload"):
+        with pytest.raises(ValueError, match="requires a Qwen4Exp model on CUDA/ROCm"):
             config.verify_model_config(model)
     else:
         config.verify_model_config(model)
