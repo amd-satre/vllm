@@ -13,6 +13,9 @@ from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
 from vllm.v1.worker.gpu.states import RequestState
 
+from .disk_offload import Qwen4ExpPLEDiskOffloadEmbedding, stage_checkpoint_rows
+from .ple_layer import Qwen4ExpNGramEmbedding
+
 
 class Qwen4ExpModelState(MambaHybridModelState):
     """Add rollback-safe PLE n-gram context to the model inputs."""
@@ -55,6 +58,12 @@ class Qwen4ExpModelState(MambaHybridModelState):
             dtype=torch.int32,
             device=self.device,
         )
+        self.disk_offload_modules = [
+            (module, module.ngram_embedding)
+            for module in model.modules()
+            if isinstance(module, Qwen4ExpNGramEmbedding)
+            and isinstance(module.ngram_embedding, Qwen4ExpPLEDiskOffloadEmbedding)
+        ]
 
     def _prepare_ngram_context(
         self,
@@ -100,9 +109,17 @@ class Qwen4ExpModelState(MambaHybridModelState):
         # Unused capacity must be zero-length requests; the replay searches the
         # whole buffer at the request count it was captured with.
         buffer[num_reqs_padded + 1 :].fill_(input_batch.num_tokens)
+        ngram_context = self._prepare_ngram_context(input_batch, req_states)
+        if self.disk_offload_modules:
+            stage_checkpoint_rows(
+                self.disk_offload_modules,
+                input_batch.input_ids,
+                query_start_loc,
+                ngram_context,
+            )
         model_inputs.update(
             query_start_loc=query_start_loc,
-            ngram_context=self._prepare_ngram_context(input_batch, req_states),
+            ngram_context=ngram_context,
         )
         return model_inputs
 

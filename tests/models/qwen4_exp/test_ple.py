@@ -2815,11 +2815,8 @@ def _build_amd_ngram_embedding(
         parameter_module, "get_tensor_model_parallel_world_size", lambda: 1
     )
 
-    monkeypatch.setattr(
-        amd_ple_layer,
-        "get_current_vllm_config",
-        lambda: SimpleNamespace(engram_config=SimpleNamespace(cpu_offload=cpu_offload)),
-    )
+    vllm_config = VllmConfig()
+    vllm_config.engram_config = EngramConfig(cpu_offload=cpu_offload)
     config = Qwen4ExpTextConfig(
         ngram_size=3,
         heads_per_ngram=1,
@@ -2830,7 +2827,7 @@ def _build_amd_ngram_embedding(
         eos_token_id=0,
         vocab_size=64,
     )
-    with torch.device(device):
+    with set_current_vllm_config(vllm_config), torch.device(device):
         module = amd_ple_layer.Qwen4ExpNGramEmbedding(
             config,
             embedding_dim=config.ple_embed_dim,
